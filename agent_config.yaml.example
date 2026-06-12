@@ -1,0 +1,15 @@
+incident_triager:
+  agent_id: "<band-agent-uuid>"
+  api_key: "<band-agent-api-key>"
+incident_reproducer:
+  agent_id: "<band-agent-uuid>"
+  api_key: "<band-agent-api-key>"
+incident_fixer:
+  agent_id: "<band-agent-uuid>"
+  api_key: "<band-agent-api-key>"
+incident_test_generator:
+  agent_id: "<band-agent-uuid>"
+  api_key: "<band-agent-api-key>"
+incident_rca_writer:
+  agent_id: "<band-agent-uuid>"
+  api_key: "<band-agent-api-key>"
