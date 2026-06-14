@@ -28,6 +28,7 @@ class BandStageAdapter(SimpleAdapter[Any]):
         tools,
         history,
         participants_msg,
+        contacts_msg,
         *,
         is_session_bootstrap: bool,
         room_id: str,
@@ -39,9 +40,9 @@ class BandStageAdapter(SimpleAdapter[Any]):
         payload = json.dumps(output.model_dump(mode="json"), separators=(",", ":"))
 
         if self.next_mention:
-            await tools.thenvoi_send_message(f"{self.next_mention} {payload}")
+            await tools.send_message(payload, mentions=[self.next_mention])
         else:
-            await tools.thenvoi_send_message(payload)
+            await tools.send_message(payload, mentions=_reply_mentions(msg, tools))
 
 
 def create_band_agents() -> list[Agent]:
@@ -83,6 +84,19 @@ def _payload_from_message(content: str) -> dict[str, Any]:
         return json.loads(content[content.index("{") :])
     except Exception:
         return {"message": content}
+
+
+def _reply_mentions(msg: Any, tools: Any) -> list[str]:
+    sender_name = getattr(msg, "sender_name", None)
+    if sender_name:
+        return [sender_name]
+
+    participants = getattr(tools, "participants", [])
+    for participant in participants:
+        mention = participant.get("handle") or participant.get("name")
+        if mention:
+            return [mention]
+    return []
 
 
 if __name__ == "__main__":
