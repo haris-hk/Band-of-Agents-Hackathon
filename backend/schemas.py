@@ -1,7 +1,13 @@
 from __future__ import annotations
 
 from datetime import datetime
-from enum import StrEnum
+try:
+    from enum import StrEnum
+except ImportError:  # pragma: no cover - compatibility for local Python 3.9 runners.
+    from enum import Enum
+
+    class StrEnum(str, Enum):
+        pass
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
@@ -130,6 +136,8 @@ class AgentHandoff(BaseModel):
     stage: Stage
     mention: str
     payload: dict[str, Any]
+    message_type: str = "band.handoff.v1"
+    summary: str | None = None
     created_at: datetime = Field(default_factory=datetime.utcnow)
 
 

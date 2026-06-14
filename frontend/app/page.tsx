@@ -3,6 +3,7 @@
 import { useMemo, useRef, useState } from "react";
 
 type AgentEvent = {
+  type?: string;
   stage: string;
   agent: string;
   status: string;
@@ -34,16 +35,36 @@ export default function IncidentDashboard() {
   }, [events]);
 
   function run() {
-    const ws = new WebSocket("ws://localhost:8000/ws/incidents");
+    let ws = wsRef.current;
+    if (ws && ws.readyState === WebSocket.OPEN) {
+      submitIncident();
+      return;
+    }
+    ws = new WebSocket("ws://localhost:8000/ws/incidents");
     wsRef.current = ws;
     setEvents([]);
     ws.onopen = () => {
       setConnected(true);
-      ws.send(JSON.stringify({ alert: JSON.parse(payload) }));
+      submitIncident();
     };
-    ws.onmessage = (message) => setEvents((current) => [...current, JSON.parse(message.data)]);
+    ws.onmessage = (message) => {
+      const event = JSON.parse(message.data);
+      if (event.type === "ping") {
+        ws?.send(JSON.stringify({ type: "pong" }));
+        return;
+      }
+      setEvents((current) => [...current, event]);
+    };
     ws.onclose = () => setConnected(false);
     ws.onerror = () => setConnected(false);
+  }
+
+  async function submitIncident() {
+    await fetch("http://localhost:8000/incidents", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ alert: JSON.parse(payload) }),
+    });
   }
 
   return (

@@ -542,6 +542,26 @@ class IncidentOrchestrator:
             self._merge_output(state, agent.stage, output)
 
             if agent.stage == Stage.REPRO:
+                self._add_handoff(
+                    state,
+                    from_agent=agent.name,
+                    to_agent="Repro Sandbox",
+                    stage=Stage.REPRO,
+                    mention="@repro-sandbox",
+                    payload=output.model_dump(mode="json"),
+                    summary="Repro plan handed to Docker sandbox for Pass 1 execution.",
+                )
+                yield self._event(
+                    state,
+                    Stage.REPRO,
+                    agent.name,
+                    "handoff",
+                    {
+                        "mention": "@repro-sandbox",
+                        "to_agent": "Repro Sandbox",
+                        "payload": output.model_dump(mode="json"),
+                    },
+                )
                 yield self._event(
                     state,
                     Stage.REPRO,
@@ -564,7 +584,10 @@ class IncidentOrchestrator:
             state.steps_run += 1
             next_stage = self.transitions[agent.stage]
             output_payload = self._output_payload(state, agent.stage, output)
-            self._add_handoff_if_needed(state, agent.name, next_stage, output_payload)
+            handoff_from = agent.name
+            if agent.stage == Stage.REPRO:
+                handoff_from = "Repro Sandbox"
+            self._add_handoff_if_needed(state, handoff_from, next_stage, output_payload)
             yield self._event(state, agent.stage, agent.name, "complete", output_payload)
 
             if next_stage != Stage.DONE:
@@ -682,13 +705,35 @@ class IncidentOrchestrator:
         if next_stage == Stage.DONE:
             return
         next_agent_name, next_mention = self._next_agent_metadata(next_stage)
+        self._add_handoff(
+            state,
+            from_agent=from_agent,
+            to_agent=next_agent_name,
+            stage=next_stage,
+            mention=next_mention,
+            payload=payload,
+            summary=f"{from_agent} handed structured incident state to {next_agent_name}.",
+        )
+
+    def _add_handoff(
+        self,
+        state: IncidentState,
+        *,
+        from_agent: str,
+        to_agent: str,
+        stage: Stage,
+        mention: str,
+        payload: dict[str, Any],
+        summary: str,
+    ) -> None:
         state.band_thread.append(
             AgentHandoff(
                 from_agent=from_agent,
-                to_agent=next_agent_name,
-                stage=next_stage,
-                mention=next_mention,
+                to_agent=to_agent,
+                stage=stage,
+                mention=mention,
                 payload=payload,
+                summary=summary,
             )
         )
 
@@ -898,11 +943,13 @@ def _fallback_patch_diff(service: str, index: int) -> str:
 
 def _fallback_tests(state: IncidentState) -> RegressionTests:
     service = state.context.service if state.context else "service"
+    module_path = service.replace("-", "_")
     return RegressionTests(
         framework="pytest",
         test_files=[f"tests/{service}/test_incident_regression.py"],
         test_code=(
             "import pytest\n\n"
+            f"from services.{module_path}.handler import handle\n\n\n"
             "def test_rejects_missing_payload():\n"
             "    with pytest.raises(ValueError, match='payload is required'):\n"
             "        handle(None)\n"
