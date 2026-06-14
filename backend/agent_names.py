@@ -5,26 +5,26 @@ import os
 from backend.schemas import Stage
 
 AGENT_CONFIG_KEYS: dict[Stage, str] = {
-    Stage.TRIAGE: "incident_triager",
+    Stage.TRIAGE: "alert_triager",
     Stage.REPRO: "incident_reproducer",
-    Stage.FIX: "incident_fixer",
-    Stage.TEST: "incident_test_generator",
-    Stage.RCA: "incident_rca_writer",
+    Stage.FIX: "patch_generator",
+    Stage.TEST: "regression_test_generator",
+    Stage.RCA: "rca_publisher",
 }
 
 AGENT_SLUGS: dict[Stage, str] = {
-    Stage.TRIAGE: "incident-triager",
+    Stage.TRIAGE: "alert-triager",
     Stage.REPRO: "incident-reproducer",
-    Stage.TEST: "incident-test-generator",
-    Stage.FIX: "incident-patch-generator",
-    Stage.RCA: "incident-rca-writer",
+    Stage.FIX: "patch-generator",
+    Stage.TEST: "test-generator",
+    Stage.RCA: "rca-publisher",
 }
 
 AGENT_DISPLAY_NAMES: dict[Stage, str] = {
     Stage.TRIAGE: "Alert Triager",
-    Stage.REPRO: "Repro Planner",
-    Stage.TEST: "Regression Test Generator",
+    Stage.REPRO: "Incident Reproducer",
     Stage.FIX: "Patch Generator",
+    Stage.TEST: "Regression Test Generator",
     Stage.RCA: "RCA Publisher",
 }
 
