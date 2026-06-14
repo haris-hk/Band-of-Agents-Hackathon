@@ -9,6 +9,7 @@ from band import Agent
 from band.config import load_agent_config
 from band.core.simple_adapter import SimpleAdapter
 
+from backend.agent_names import AGENT_CONFIG_KEYS, AGENT_DISPLAY_NAMES, agent_mention
 from backend.agent_loop import IncidentAgent, build_agents
 from backend.configuration import AGENT_CONFIG_PATH, load_project_env
 from backend.inference import InferenceClients
@@ -51,22 +52,18 @@ def create_band_agents() -> list[Agent]:
     load_project_env()
     stages = build_agents()
     order = [Stage.TRIAGE, Stage.REPRO, Stage.TEST, Stage.FIX, Stage.RCA]
-    config_keys = {
-        Stage.TRIAGE: "incident_triager",
-        Stage.REPRO: "incident_reproducer",
-        Stage.FIX: "incident_fixer",
-        Stage.TEST: "incident_test_generator",
-        Stage.RCA: "incident_rca_writer",
-    }
     agents: list[Agent] = []
     for index, stage in enumerate(order):
         next_stage = order[index + 1] if index + 1 < len(order) else None
-        agent_id, api_key = load_agent_config(config_keys[stage], config_path=AGENT_CONFIG_PATH)
+        agent_id, api_key = load_agent_config(
+            AGENT_CONFIG_KEYS[stage],
+            config_path=AGENT_CONFIG_PATH,
+        )
         agents.append(
             Agent.create(
                 adapter=CustomAdapter(
                     stages[stage],
-                    stages[next_stage].mention if next_stage else None,
+                    agent_mention(next_stage) if next_stage else None,
                 ),
                 agent_id=agent_id,
                 api_key=api_key,
@@ -135,13 +132,7 @@ def _merge_stage_output(state: IncidentState, stage: Stage, output: Any) -> None
 
 
 def _agent_name_for_stage(stage: Stage) -> str:
-    return {
-        Stage.TRIAGE: "Alert Triager",
-        Stage.REPRO: "Repro Planner",
-        Stage.TEST: "Regression Test Generator",
-        Stage.FIX: "Patch Generator",
-        Stage.RCA: "RCA Publisher",
-    }.get(stage, stage.value)
+    return AGENT_DISPLAY_NAMES.get(stage, stage.value)
 
 
 def _reply_mentions(msg: Any, tools: Any) -> list[str]:

@@ -12,6 +12,7 @@ from typing import Any, AsyncIterator, Callable
 
 from pydantic import BaseModel
 
+from backend.agent_names import AGENT_DISPLAY_NAMES, agent_mention
 from backend.inference import InferenceClients
 from backend.schemas import (
     AgentEvent,
@@ -794,8 +795,8 @@ class IncidentOrchestrator:
 def build_agents() -> dict[Stage, IncidentAgent]:
     return {
         Stage.TRIAGE: IncidentAgent(
-            name="Alert Triager",
-            mention="@incident-triager",
+            name=AGENT_DISPLAY_NAMES[Stage.TRIAGE],
+            mention=agent_mention(Stage.TRIAGE),
             stage=Stage.TRIAGE,
             provider=Provider.AIML,
             model_env="TRIAGE_MODEL",
@@ -808,8 +809,8 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             fallback=_fallback_triage,
         ),
         Stage.REPRO: IncidentAgent(
-            name="Repro Planner",
-            mention="@incident-reproducer",
+            name=AGENT_DISPLAY_NAMES[Stage.REPRO],
+            mention=agent_mention(Stage.REPRO),
             stage=Stage.REPRO,
             provider=Provider.AIML,
             model_env="REPRO_MODEL",
@@ -822,8 +823,8 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             fallback=_fallback_repro,
         ),
         Stage.TEST: IncidentAgent(
-            name="Regression Test Generator",
-            mention="@incident-test-generator",
+            name=AGENT_DISPLAY_NAMES[Stage.TEST],
+            mention=agent_mention(Stage.TEST),
             stage=Stage.TEST,
             provider=Provider.AIML,
             model_env="REGRESSION_TEST_MODEL",
@@ -837,8 +838,8 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             fallback=_fallback_tests,
         ),
         Stage.FIX: IncidentAgent(
-            name="Patch Generator",
-            mention="@incident-patch-generator",
+            name=AGENT_DISPLAY_NAMES[Stage.FIX],
+            mention=agent_mention(Stage.FIX),
             stage=Stage.FIX,
             provider=Provider.FEATHERLESS,
             model_env="PATCH_GENERATOR_MODEL",
@@ -851,8 +852,8 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             fallback=_fallback_fix,
         ),
         Stage.RCA: IncidentAgent(
-            name="RCA Publisher",
-            mention="@incident-rca-writer",
+            name=AGENT_DISPLAY_NAMES[Stage.RCA],
+            mention=agent_mention(Stage.RCA),
             stage=Stage.RCA,
             provider=Provider.AIML,
             model_env="RCA_MODEL",
