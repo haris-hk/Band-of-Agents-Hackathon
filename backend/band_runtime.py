@@ -47,7 +47,7 @@ class BandStageAdapter(SimpleAdapter[Any]):
 def create_band_agents() -> list[Agent]:
     load_dotenv()
     stages = build_agents()
-    order = [Stage.TRIAGE, Stage.REPRO, Stage.FIX, Stage.TEST, Stage.RCA]
+    order = [Stage.TRIAGE, Stage.REPRO, Stage.TEST, Stage.FIX, Stage.RCA]
     config_keys = {
         Stage.TRIAGE: "incident_triager",
         Stage.REPRO: "incident_reproducer",

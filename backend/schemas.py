@@ -5,14 +5,15 @@ from enum import StrEnum
 from typing import Any, Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 
 class Stage(StrEnum):
     TRIAGE = "triage"
     REPRO = "repro"
-    FIX = "fix"
     TEST = "test"
+    FIX = "fix"
+    VALIDATE = "validate"
     RCA = "rca"
     DONE = "done"
     FAILED = "failed"
@@ -54,6 +55,17 @@ class ReproPlan(BaseModel):
     required_data: list[str] = Field(default_factory=list)
 
 
+class ReproExecution(BaseModel):
+    image: str
+    command: str
+    exit_code: int | None = None
+    timed_out: bool = False
+    failure_observed: bool = False
+    logs: str = ""
+    stack_trace: str = ""
+    error: str | None = None
+
+
 class CodePatch(BaseModel):
     summary: str
     files_changed: list[str] = Field(default_factory=list)
@@ -62,12 +74,39 @@ class CodePatch(BaseModel):
     rollback_plan: str
 
 
+class CandidatePatches(BaseModel):
+    candidates: list[CodePatch] = Field(min_length=2, max_length=2)
+
+    @model_validator(mode="after")
+    def validate_distinct_diffs(self) -> "CandidatePatches":
+        diffs = [candidate.patch_unified_diff.strip() for candidate in self.candidates]
+        if len(set(diffs)) != len(diffs):
+            raise ValueError("candidate patches must contain distinct unified diffs")
+        return self
+
+
 class RegressionTests(BaseModel):
     framework: str = "pytest"
-    test_files: list[str] = Field(default_factory=list)
+    test_files: list[str] = Field(default_factory=list, max_length=1)
     test_code: str
     run_command: str = "pytest"
     acceptance_criteria: list[str] = Field(default_factory=list)
+
+
+class PatchValidationResult(BaseModel):
+    candidate_index: int
+    validation_passed: bool
+    timed_out: bool = False
+    exit_code: int | None = None
+    logs: str = ""
+    error: str | None = None
+    patch_summary: str | None = None
+
+
+class ValidationSwarmResult(BaseModel):
+    winning_candidate_index: int | None = None
+    winning_patch: CodePatch | None = None
+    results: list[PatchValidationResult] = Field(default_factory=list)
 
 
 class RCAReport(BaseModel):
@@ -78,6 +117,10 @@ class RCAReport(BaseModel):
     timeline: list[str] = Field(default_factory=list)
     remediation: list[str] = Field(default_factory=list)
     prevention: list[str] = Field(default_factory=list)
+    git_branch: str | None = None
+    commit_message: str | None = None
+    patch_unified_diff: str | None = None
+    validation_summary: str | None = None
     final_markdown: str
 
 
@@ -103,13 +146,16 @@ class AgentEvent(BaseModel):
 class IncidentState(BaseModel):
     run_id: UUID = Field(default_factory=uuid4)
     current_stage: Stage = Stage.TRIAGE
-    max_steps: int = 5
+    max_steps: int = 6
     steps_run: int = 0
     raw_alert: RawAlert
     context: IncidentContext | None = None
     repro: ReproPlan | None = None
+    repro_execution: ReproExecution | None = None
+    candidate_patches: CandidatePatches | None = None
     fix: CodePatch | None = None
     tests: RegressionTests | None = None
+    validation: ValidationSwarmResult | None = None
     rca: RCAReport | None = None
     band_thread: list[AgentHandoff] = Field(default_factory=list)
     events: list[AgentEvent] = Field(default_factory=list)
