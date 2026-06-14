@@ -46,6 +46,30 @@ def truncate_logs(log_string: str, max_lines: int = 200) -> str:
     return "\n".join(log_string.splitlines()[-max_lines:])
 
 
+# 1. Move load_repo_files OUTSIDE the class as a standalone helper
+def load_repo_files(repo_path: str, max_files: int = 20) -> dict:
+    code_map = {}
+    if not os.path.exists(repo_path):
+        return code_map
+
+    for root, _, files in os.walk(repo_path):
+        for f in files:
+            # Add other extensions if needed (e.g., .tsx, .rs, .md)
+            if f.endswith((".py", ".ts", ".js", ".go", ".java")):
+                full_path = os.path.join(root, f)
+                try:
+                    with open(full_path, "r", encoding="utf-8") as file:
+                        # Store by relative path for cleaner LLM context
+                        rel_path = os.path.relpath(full_path, repo_path)
+                        code_map[rel_path] = file.read()
+                except Exception:
+                    continue
+
+                if len(code_map) >= max_files:
+                    return code_map
+
+    return code_map
+
 @dataclass(frozen=True)
 class IncidentAgent:
     name: str
@@ -59,7 +83,18 @@ class IncidentAgent:
     default_model: str
 
     async def run(self, state: IncidentState, llm: InferenceClients) -> BaseModel:
-        prompt = json.dumps(state.model_dump(mode="json"), separators=(",", ":"))
+        # Dump state to dict first
+        state_dict = state.model_dump(mode="json")
+
+        # Resolve repo path (fallback to alert payload if state isn't explicitly set)
+        active_repo_path = state.repo_path or state.raw_alert.payload.get("repo_path")
+
+        # INJECT REAL CODE: Only for agents that need to see code
+        if active_repo_path and self.stage in {Stage.REPRO, Stage.TEST, Stage.FIX}:
+            state_dict["repository_files"] = load_repo_files(active_repo_path)
+
+        prompt = json.dumps(state_dict, separators=(",", ":"))
+
         try:
             return await llm.json_call(
                 provider=self.provider,
@@ -72,29 +107,10 @@ class IncidentAgent:
             state.errors.append(f"{self.name}: {exc}")
             return self.fallback(state)
 
+
     @property
     def model_name(self) -> str:
         return os.getenv(self.model_env) or self.default_model
-    
-    def load_repo_files(repo_path: str, max_files: int = 20) -> dict:
-        code_map = {}
-
-        for root, _, files in os.walk(repo_path):
-            for f in files:
-                if f.endswith((".py", ".ts", ".js", ".go", ".java")):
-                    full_path = os.path.join(root, f)
-
-                    try:
-                        with open(full_path, "r", encoding="utf-8") as file:
-                            code_map[full_path] = file.read()
-
-                    except Exception:
-                        continue
-
-                    if len(code_map) >= max_files:
-                        return code_map
-
-        return code_map
 
 @dataclass(frozen=True)
 class DockerSandboxConfig:
@@ -826,10 +842,20 @@ class IncidentOrchestrator:
         self.agents = build_agents()
 
     async def run(self, alert: dict[str, Any]) -> AsyncIterator[AgentEvent]:
-        state = IncidentState(raw_alert=RawAlert(payload=alert))
+        # Extract repo context immediately
+        repo_path = alert.get("repo_path", "")
+        # Fallback to service name if full name isn't provided, to prevent crashes
+        repo_full_name = alert.get("repo_full_name") or alert.get("service", "unknown/unknown")
+
+        state = IncidentState(
+            raw_alert=RawAlert(payload=alert),
+            repo_path=repo_path,
+            repo_full_name=repo_full_name,
+        )
         yield self._event(state, Stage.TRIAGE, "orchestrator", "queued", {"alert": alert})
 
         while state.current_stage not in {Stage.DONE, Stage.FAILED}:
+
             if state.steps_run >= state.max_steps:
                 state.current_stage = Stage.FAILED
                 yield self._event(
@@ -924,8 +950,8 @@ class IncidentOrchestrator:
         if state.rca and getattr(state.rca, "patch_unified_diff", None):
             try:
                 from backend.git_output import push_fix_as_pr
-                repo_path: str = state.raw_alert.payload.get("repo_path", "")
-                pr_url = await push_fix_as_pr(state=state, repo_path=repo_path)
+                # Use the consistently set repo_path from the state
+                pr_url = await push_fix_as_pr(state=state, repo_path=state.repo_path)
             except Exception as exc:
                 pr_error = str(exc)
         # ── END NEW ───────────────────────────────────────────────────────────
@@ -1192,15 +1218,12 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
             output_model=CandidatePatches,
             system_prompt=(
-                  "You are an expert software engineer generating patches for a production incident. "
-        "You receive Pass 1 Docker logs showing the failure and a regression test showing the "
-        "expected correct behavior. "
-        "Generate exactly two distinct candidate unified diffs in standard patch -p1 format. "
-        "Each candidate must: target a different root cause hypothesis or fix strategy, "
-        "be a minimal focused change — no refactors, no unrelated cleanup, "
-        "make the regression test pass if applied correctly. "
-        "The two candidates must differ meaningfully — not just whitespace or variable names. "
-        "Return JSON only matching the CandidatePatches schema."
+                "You are an expert software engineer generating patches for a production incident. "
+                "You receive Pass 1 Docker logs, a regression test, AND 'repository_files' containing the actual source code. "
+                "CRITICAL INSTRUCTION: You MUST base your patch on the actual code provided in 'repository_files'. "
+                "Do NOT hallucinate file paths or code structures. "
+                "Generate exactly two distinct candidate unified diffs in standard patch -p1 format. "
+                "Return JSON only matching the CandidatePatches schema."
             ),
             fallback=_fallback_fix,
         ),
@@ -1268,21 +1291,12 @@ def _fallback_repro(state: IncidentState) -> ReproPlan:
 
 
 def _fallback_fix(state: IncidentState) -> CandidatePatches:
-    service = state.context.service if state.context else "service"
-    candidates = [
-        CodePatch(
-            summary=(
-                f"Candidate {index + 1}: add defensive validation around failing path "
-                f"in {service}."
-            ),
-            files_changed=[f"services/{service}/handler.py"],
-            patch_unified_diff=_fallback_patch_diff(service, index),
-            risk_notes=["Placeholder patch; replace with repository-specific diff after repro."],
-            rollback_plan="Revert the patch commit and redeploy the previous stable artifact.",
-        )
-        for index in range(MAX_VALIDATION_CANDIDATES)
-    ]
-    return CandidatePatches(candidates=candidates)
+    # Repo-aware requirement: if we don't have repo context, never generate placeholder diffs.
+    # This prevents committing hallucinated patches such as services/unknown-service/...
+    raise RuntimeError(
+        "FIX agent requires repository_files (state.repo_path must be set and loadable)."
+    )
+
 
 
 def _fallback_patch_diff(service: str, index: int) -> str:
