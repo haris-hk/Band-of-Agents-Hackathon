@@ -105,7 +105,11 @@ class IncidentAgent:
             )
         except Exception as exc:
             state.errors.append(f"{self.name}: {exc}")
+            # Repo-aware safety: never let FIX fall back to placeholder diffs.
+            if self.stage == Stage.FIX:
+                raise
             return self.fallback(state)
+
 
 
     @property
