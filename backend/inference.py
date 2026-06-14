@@ -117,6 +117,7 @@ class InferenceClients:
         system: str,
         user: str,
         output_model: type[T],
+        model: str | None = None,
     ) -> T:
         if not self.settings.live_llm_enabled:
             raise GuardrailBlocked("LIVE_LLM_ENABLED=false")
@@ -124,7 +125,9 @@ class InferenceClients:
         client = self.aiml if provider == Provider.AIML else self.featherless
         if client is None:
             raise GuardrailBlocked("LIVE_LLM_ENABLED=true but openai package is not installed")
-        model = self.settings.aiml_model if provider == Provider.AIML else self.settings.featherless_model
+        model = model or (
+            self.settings.aiml_model if provider == Provider.AIML else self.settings.featherless_model
+        )
         price = 0.01 if provider == Provider.AIML else 0.002
 
         schema_hint = output_model.model_json_schema()
