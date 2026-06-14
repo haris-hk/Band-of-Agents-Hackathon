@@ -7,7 +7,7 @@ name = "band-incident-response"
 version = "0.1.0"
 requires-python = ">=3.11"
 dependencies = [
-  "band-sdk>=0.1.0",
+  "band-sdk>=1.0.0",
   "docker>=7.1.0",
   "fastapi>=0.115.0",
   "openai>=1.55.0",

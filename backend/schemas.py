@@ -168,6 +168,8 @@ class IncidentState(BaseModel):
     band_thread: list[AgentHandoff] = Field(default_factory=list)
     events: list[AgentEvent] = Field(default_factory=list)
     errors: list[str] = Field(default_factory=list)
+    repo_path: str | None = None
+    repo_full_name: str | None = None
 
 
 class RunRequest(BaseModel):

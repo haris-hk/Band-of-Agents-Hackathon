@@ -5,6 +5,7 @@ from unittest.mock import patch
 
 from pydantic import BaseModel
 
+from backend.agent_names import AGENT_DISPLAY_NAMES, agent_mention
 from backend.agent_loop import IncidentAgent, IncidentOrchestrator, _fallback_fix, _fallback_rca
 from backend.agent_loop import _fallback_repro, _fallback_tests, _fallback_triage
 from backend.schemas import (
@@ -29,8 +30,8 @@ class FallbackOnlyAgent(IncidentAgent):
 def fake_agents() -> dict[Stage, IncidentAgent]:
     agents = {
         Stage.TRIAGE: IncidentAgent(
-            name="Alert Triager",
-            mention="@incident-triager",
+            name=AGENT_DISPLAY_NAMES[Stage.TRIAGE],
+            mention=agent_mention(Stage.TRIAGE),
             stage=Stage.TRIAGE,
             provider=Provider.AIML,
             output_model=IncidentContext,
@@ -40,8 +41,8 @@ def fake_agents() -> dict[Stage, IncidentAgent]:
             default_model="",
         ),
         Stage.REPRO: IncidentAgent(
-            name="Repro Planner",
-            mention="@incident-reproducer",
+            name=AGENT_DISPLAY_NAMES[Stage.REPRO],
+            mention=agent_mention(Stage.REPRO),
             stage=Stage.REPRO,
             provider=Provider.AIML,
             output_model=ReproPlan,
@@ -51,8 +52,8 @@ def fake_agents() -> dict[Stage, IncidentAgent]:
             default_model="",
         ),
         Stage.TEST: IncidentAgent(
-            name="Regression Test Generator",
-            mention="@incident-test-generator",
+            name=AGENT_DISPLAY_NAMES[Stage.TEST],
+            mention=agent_mention(Stage.TEST),
             stage=Stage.TEST,
             provider=Provider.AIML,
             output_model=RegressionTests,
@@ -62,8 +63,8 @@ def fake_agents() -> dict[Stage, IncidentAgent]:
             default_model="",
         ),
         Stage.FIX: IncidentAgent(
-            name="Patch Generator",
-            mention="@incident-patch-generator",
+            name=AGENT_DISPLAY_NAMES[Stage.FIX],
+            mention=agent_mention(Stage.FIX),
             stage=Stage.FIX,
             provider=Provider.FEATHERLESS,
             output_model=CandidatePatches,
@@ -73,8 +74,8 @@ def fake_agents() -> dict[Stage, IncidentAgent]:
             default_model="",
         ),
         Stage.RCA: IncidentAgent(
-            name="RCA Publisher",
-            mention="@incident-rca-writer",
+            name=AGENT_DISPLAY_NAMES[Stage.RCA],
+            mention=agent_mention(Stage.RCA),
             stage=Stage.RCA,
             provider=Provider.AIML,
             output_model=RCAReport,
