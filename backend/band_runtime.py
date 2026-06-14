@@ -14,7 +14,8 @@ from backend.agent_loop import IncidentAgent, build_agents
 from backend.configuration import AGENT_CONFIG_PATH, load_project_env
 from backend.inference import InferenceClients
 from backend.schemas import IncidentState, RawAlert, Stage
-
+REPO_PATH = os.getenv("REPO_PATH", r"D:/Coding/mock-buggy-project")
+REPO_FULL_NAME = os.getenv("REPO_FULL_NAME", "hamzaraza123/mock-buggy-project")
 
 class CustomAdapter(SimpleAdapter[Any]):
     def __init__(self, stage_agent: IncidentAgent, next_mention: str | None) -> None:
@@ -88,14 +89,31 @@ def _payload_from_message(content: str) -> dict[str, Any]:
 
 def _state_from_message(content: str) -> IncidentState:
     payload = _payload_from_message(content)
+
     if payload.get("message_type") == "band.handoff.v1":
         state_payload = payload.get("state")
         if isinstance(state_payload, dict):
-            return IncidentState.model_validate(state_payload)
+            state = IncidentState.model_validate(state_payload)
+
+            # ✅ ADD THIS
+            state.repo_path = REPO_PATH
+            state.repo_full_name = REPO_FULL_NAME
+
+            return state
+
         handoff_payload = payload.get("payload")
         if isinstance(handoff_payload, dict):
-            return IncidentState(raw_alert=RawAlert(payload=handoff_payload))
-    return IncidentState(raw_alert=RawAlert(payload=payload))
+            return IncidentState(
+                raw_alert=RawAlert(payload=handoff_payload),
+                repo_path=REPO_PATH,              # ✅ ADD
+                repo_full_name=REPO_FULL_NAME     # ✅ ADD
+            )
+
+    return IncidentState(
+        raw_alert=RawAlert(payload=payload),
+        repo_path=REPO_PATH,                  # ✅ ADD
+        repo_full_name=REPO_FULL_NAME         # ✅ ADD
+    )
 
 
 def _handoff_payload(
@@ -115,7 +133,11 @@ def _handoff_payload(
 def _merge_stage_output(state: IncidentState, stage: Stage, output: Any) -> None:
     if stage == Stage.TRIAGE:
         state.context = output
-        state.current_stage = Stage.REPRO
+
+        # ✅ FORCE CONSISTENT REPO IDENTITY
+        if state.repo_full_name:
+            state.context.service = state.repo_full_name.split("/")[-1]  # optional label
+            state.context.environment = "production"
     elif stage == Stage.REPRO:
         state.repro = output
         state.current_stage = Stage.TEST
@@ -125,7 +147,10 @@ def _merge_stage_output(state: IncidentState, stage: Stage, output: Any) -> None
     elif stage == Stage.FIX:
         state.candidate_patches = output
         state.fix = output.candidates[0] if output.candidates else None
-        state.current_stage = Stage.RCA
+
+        # 🔥 CRITICAL: pass repo context forward
+        if state.context:
+            state.context.service = state.repo_full_name
     elif stage == Stage.RCA:
         state.rca = output
         state.current_stage = Stage.DONE

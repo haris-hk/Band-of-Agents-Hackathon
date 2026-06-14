@@ -9,7 +9,7 @@ import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Callable
-
+from backend.git_output import push_fix_as_pr
 from pydantic import BaseModel
 
 from backend.agent_names import AGENT_DISPLAY_NAMES, agent_mention
@@ -75,7 +75,26 @@ class IncidentAgent:
     @property
     def model_name(self) -> str:
         return os.getenv(self.model_env) or self.default_model
+    
+    def load_repo_files(repo_path: str, max_files: int = 20) -> dict:
+        code_map = {}
 
+        for root, _, files in os.walk(repo_path):
+            for f in files:
+                if f.endswith((".py", ".ts", ".js", ".go", ".java")):
+                    full_path = os.path.join(root, f)
+
+                    try:
+                        with open(full_path, "r", encoding="utf-8") as file:
+                            code_map[full_path] = file.read()
+
+                    except Exception:
+                        continue
+
+                    if len(code_map) >= max_files:
+                        return code_map
+
+        return code_map
 
 @dataclass(frozen=True)
 class DockerSandboxConfig:
@@ -501,6 +520,297 @@ async def _terminate_pending_validations(
     return cancelled_results
 
 
+# class IncidentOrchestrator:
+#     transitions = {
+#         Stage.TRIAGE: Stage.REPRO,
+#         Stage.REPRO: Stage.TEST,
+#         Stage.TEST: Stage.FIX,
+#         Stage.FIX: Stage.VALIDATE,
+#         Stage.VALIDATE: Stage.RCA,
+#         Stage.RCA: Stage.DONE,
+#     }
+
+#     def __init__(self, llm: InferenceClients | None = None) -> None:
+#         self.llm = llm or InferenceClients()
+#         self.agents = build_agents()
+
+#     async def run(self, alert: dict[str, Any]) -> AsyncIterator[AgentEvent]:
+#         state = IncidentState(raw_alert=RawAlert(payload=alert))
+#         yield self._event(state, Stage.TRIAGE, "orchestrator", "queued", {"alert": alert})
+
+#         while state.current_stage not in {Stage.DONE, Stage.FAILED}:
+#             if state.steps_run >= state.max_steps:
+#                 state.current_stage = Stage.FAILED
+#                 yield self._event(
+#                     state,
+#                     Stage.FAILED,
+#                     "orchestrator",
+#                     "failed",
+#                     error="max_steps exceeded",
+#                 )
+#                 return
+
+#             if state.current_stage == Stage.VALIDATE:
+#                 async for event in self._run_validation_stage(state):
+#                     yield event
+#                 continue
+
+#             agent = self.agents[state.current_stage]
+#             yield self._event(state, agent.stage, agent.name, "active", self._stage_payload(state))
+
+#             output = await agent.run(state, self.llm)
+#             self._merge_output(state, agent.stage, output)
+
+#             if agent.stage == Stage.REPRO:
+#                 self._add_handoff(
+#                     state,
+#                     from_agent=agent.name,
+#                     to_agent="Repro Sandbox",
+#                     stage=Stage.REPRO,
+#                     mention="@repro-sandbox",
+#                     payload=output.model_dump(mode="json"),
+#                     summary="Repro plan handed to Docker sandbox for Pass 1 execution.",
+#                 )
+#                 yield self._event(
+#                     state,
+#                     Stage.REPRO,
+#                     agent.name,
+#                     "handoff",
+#                     {
+#                         "mention": "@repro-sandbox",
+#                         "to_agent": "Repro Sandbox",
+#                         "payload": output.model_dump(mode="json"),
+#                     },
+#                 )
+#                 yield self._event(
+#                     state,
+#                     Stage.REPRO,
+#                     "Repro Sandbox",
+#                     "active",
+#                     {"timeout_seconds": DEFAULT_CONTAINER_TIMEOUT_SECONDS},
+#                 )
+#                 state.repro_execution = await run_repro_pass1(
+#                     state,
+#                     output,  # type: ignore[arg-type]
+#                 )
+#                 yield self._event(
+#                     state,
+#                     Stage.REPRO,
+#                     "Repro Sandbox",
+#                     "complete",
+#                     state.repro_execution.model_dump(mode="json"),
+#                 )
+
+#             state.steps_run += 1
+#             next_stage = self.transitions[agent.stage]
+#             output_payload = self._output_payload(state, agent.stage, output)
+#             handoff_from = agent.name
+#             if agent.stage == Stage.REPRO:
+#                 handoff_from = "Repro Sandbox"
+#             self._add_handoff_if_needed(state, handoff_from, next_stage, output_payload)
+#             yield self._event(state, agent.stage, agent.name, "complete", output_payload)
+
+#             if next_stage != Stage.DONE:
+#                 next_agent_name, next_mention = self._next_agent_metadata(next_stage)
+#                 yield self._event(
+#                     state,
+#                     next_stage,
+#                     agent.name,
+#                     "handoff",
+#                     {
+#                         "mention": next_mention,
+#                         "to_agent": next_agent_name,
+#                         "payload": self._stage_payload(state),
+#                     },
+#                 )
+
+#             state.current_stage = next_stage
+
+#         yield self._event(
+#             state,
+#             Stage.DONE,
+#             "orchestrator",
+#             "done",
+#             {
+#                 "rca": state.rca.model_dump(mode="json") if state.rca else None,
+#                 "fix": state.fix.model_dump(mode="json") if state.fix else None,
+#                 "validation": (
+#                     state.validation.model_dump(mode="json") if state.validation else None
+#                 ),
+#             },
+#         )
+
+#     async def _run_validation_stage(self, state: IncidentState) -> AsyncIterator[AgentEvent]:
+#         yield self._event(
+#             state,
+#             Stage.VALIDATE,
+#             "Validation Swarm",
+#             "active",
+#             self._stage_payload(state),
+#         )
+#         if state.candidate_patches is None or state.tests is None:
+#             state.current_stage = Stage.FAILED
+#             yield self._event(
+#                 state,
+#                 Stage.FAILED,
+#                 "Validation Swarm",
+#                 "failed",
+#                 error="validation requires candidate patches and regression tests",
+#             )
+#             return
+
+#         state.validation = await run_validation_swarm(state, state.candidate_patches, state.tests)
+#         state.fix = state.validation.winning_patch
+#         state.steps_run += 1
+
+#         if state.fix is None:
+#             state.current_stage = Stage.FAILED
+#             yield self._event(
+#                 state,
+#                 Stage.FAILED,
+#                 "Validation Swarm",
+#                 "failed",
+#                 state.validation.model_dump(mode="json"),
+#                 error="no candidate patch passed validation",
+#             )
+#             return
+
+#         next_stage = self.transitions[Stage.VALIDATE]
+#         self._add_handoff_if_needed(
+#             state,
+#             "Validation Swarm",
+#             next_stage,
+#             state.validation.model_dump(mode="json"),
+#         )
+#         yield self._event(
+#             state,
+#             Stage.VALIDATE,
+#             "Validation Swarm",
+#             "complete",
+#             state.validation.model_dump(mode="json"),
+#         )
+#         next_agent_name, next_mention = self._next_agent_metadata(next_stage)
+#         yield self._event(
+#             state,
+#             next_stage,
+#             "Validation Swarm",
+#             "handoff",
+#             {
+#                 "mention": next_mention,
+#                 "to_agent": next_agent_name,
+#                 "payload": self._stage_payload(state),
+#             },
+#         )
+#         state.current_stage = next_stage
+
+#     def _merge_output(self, state: IncidentState, stage: Stage, output: BaseModel) -> None:
+#         if stage == Stage.TRIAGE:
+#             state.context = output  # type: ignore[assignment]
+#         elif stage == Stage.REPRO:
+#             state.repro = output  # type: ignore[assignment]
+#         elif stage == Stage.TEST:
+#             state.tests = output  # type: ignore[assignment]
+#         elif stage == Stage.FIX:
+#             state.candidate_patches = output  # type: ignore[assignment]
+#         elif stage == Stage.RCA:
+#             state.rca = output  # type: ignore[assignment]
+
+#     def _add_handoff_if_needed(
+#         self,
+#         state: IncidentState,
+#         from_agent: str,
+#         next_stage: Stage,
+#         payload: dict[str, Any],
+#     ) -> None:
+#         if next_stage == Stage.DONE:
+#             return
+#         next_agent_name, next_mention = self._next_agent_metadata(next_stage)
+#         self._add_handoff(
+#             state,
+#             from_agent=from_agent,
+#             to_agent=next_agent_name,
+#             stage=next_stage,
+#             mention=next_mention,
+#             payload=payload,
+#             summary=f"{from_agent} handed structured incident state to {next_agent_name}.",
+#         )
+
+#     def _add_handoff(
+#         self,
+#         state: IncidentState,
+#         *,
+#         from_agent: str,
+#         to_agent: str,
+#         stage: Stage,
+#         mention: str,
+#         payload: dict[str, Any],
+#         summary: str,
+#     ) -> None:
+#         state.band_thread.append(
+#             AgentHandoff(
+#                 from_agent=from_agent,
+#                 to_agent=to_agent,
+#                 stage=stage,
+#                 mention=mention,
+#                 payload=payload,
+#                 summary=summary,
+#             )
+#         )
+
+#     def _next_agent_metadata(self, stage: Stage) -> tuple[str, str]:
+#         if stage == Stage.VALIDATE:
+#             return "Validation Swarm", "@validation-swarm"
+#         agent = self.agents[stage]
+#         return agent.name, agent.mention
+
+#     def _event(
+#         self,
+#         state: IncidentState,
+#         stage: Stage,
+#         agent: str,
+#         status: str,
+#         payload: dict[str, Any] | None = None,
+#         error: str | None = None,
+#     ) -> AgentEvent:
+#         event = AgentEvent(
+#             run_id=state.run_id,
+#             stage=stage,
+#             agent=agent,
+#             status=status,  # type: ignore[arg-type]
+#             payload=payload or {},
+#             error=error,
+#         )
+#         state.events.append(event)
+#         return event
+
+#     def _stage_payload(self, state: IncidentState) -> dict[str, Any]:
+#         return {
+#             "context": state.context.model_dump(mode="json") if state.context else None,
+#             "repro": state.repro.model_dump(mode="json") if state.repro else None,
+#             "repro_execution": (
+#                 state.repro_execution.model_dump(mode="json") if state.repro_execution else None
+#             ),
+#             "tests": state.tests.model_dump(mode="json") if state.tests else None,
+#             "candidate_patches": (
+#                 state.candidate_patches.model_dump(mode="json") if state.candidate_patches else None
+#             ),
+#             "fix": state.fix.model_dump(mode="json") if state.fix else None,
+#             "validation": state.validation.model_dump(mode="json") if state.validation else None,
+#             "errors": state.errors,
+#         }
+
+#     def _output_payload(
+#         self,
+#         state: IncidentState,
+#         stage: Stage,
+#         output: BaseModel,
+#     ) -> dict[str, Any]:
+#         payload = output.model_dump(mode="json")
+#         if stage == Stage.REPRO and state.repro_execution:
+#             payload["repro_execution"] = state.repro_execution.model_dump(mode="json")
+#         return payload
+
+
 class IncidentOrchestrator:
     transitions = {
         Stage.TRIAGE: Stage.REPRO,
@@ -607,6 +917,19 @@ class IncidentOrchestrator:
 
             state.current_stage = next_stage
 
+        # ── NEW: push fix as a GitHub PR once RCA is complete ─────────────────
+        pr_url: str | None = None
+        pr_error: str | None = None
+
+        if state.rca and getattr(state.rca, "patch_unified_diff", None):
+            try:
+                from backend.git_output import push_fix_as_pr
+                repo_path: str = state.raw_alert.payload.get("repo_path", "")
+                pr_url = await push_fix_as_pr(state=state, repo_path=repo_path)
+            except Exception as exc:
+                pr_error = str(exc)
+        # ── END NEW ───────────────────────────────────────────────────────────
+
         yield self._event(
             state,
             Stage.DONE,
@@ -618,6 +941,9 @@ class IncidentOrchestrator:
                 "validation": (
                     state.validation.model_dump(mode="json") if state.validation else None
                 ),
+                # ── NEW fields ─────────────────────────────────────────────
+                "pr_url": pr_url,
+                "pr_error": pr_error,
             },
         )
 
@@ -790,6 +1116,8 @@ class IncidentOrchestrator:
         if stage == Stage.REPRO and state.repro_execution:
             payload["repro_execution"] = state.repro_execution.model_dump(mode="json")
         return payload
+    
+    
 
 
 def build_agents() -> dict[Stage, IncidentAgent]:
@@ -803,8 +1131,14 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="gpt-4o-mini",
             output_model=IncidentContext,
             system_prompt=(
-                "Extract incident JSON from webhook data. Use a fast, cheap model path. "
-                "Return JSON only."
+                 "You are an on-call incident triager. You receive raw webhook payloads from alerting "
+        "systems like PagerDuty, Datadog, or Sentry. "
+        "Extract a structured incident context with: service name, environment, severity, "
+        "error type, error message, stack trace if present, and estimated user impact. "
+        "Be precise — downstream agents depend entirely on what you extract. "
+        "If a field is missing from the payload, infer it from context or mark it null. "
+        "Never hallucinate stack traces or error messages. "
+        "Return JSON only matching the IncidentContext schema."
             ),
             fallback=_fallback_triage,
         ),
@@ -817,8 +1151,14 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="gpt-4o",
             output_model=ReproPlan,
             system_prompt=(
-                "Plan Pass 1 reproduction for a local Docker sandbox. Return deterministic failing "
-                "state expectations as JSON only."
+                 "You are a senior SRE planning a local Docker reproduction of a production incident. "
+        "You receive a structured IncidentContext. Your job is to produce a deterministic repro plan: "
+        "the exact command that should fail, what exit code or exception to expect, "
+        "which files or endpoints are involved, and any environment variables needed. "
+        "Assume the repo is mounted at /workspace inside a python:3.11-slim container. "
+        "The repro command must be a single shell command that reproduces the failure reliably. "
+        "Do not guess — if you cannot determine the repro command from context, say so explicitly. "
+        "Return JSON only matching the ReproPlan schema."
             ),
             fallback=_fallback_repro,
         ),
@@ -831,9 +1171,15 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="gpt-4o",
             output_model=RegressionTests,
             system_prompt=(
-                "Read Pass 1 Docker logs and write exactly one strict failing pytest "
-                "regression test. "
-                "Return JSON only."
+                "You are a test engineer writing a regression test to permanently catch a production bug. "
+        "You receive Pass 1 Docker execution logs including stdout, stderr, and stack traces. "
+        "Write exactly one pytest test function that: "
+        "directly targets the failing code path shown in the logs, "
+        "asserts the correct behavior (not the buggy behavior), "
+        "will fail on the current buggy code and pass only after a correct fix is applied. "
+        "The test must be strict — no broad exception catches, no assertTrue(True). "
+        "Import only from the standard library or packages already in the repo. "
+        "Return JSON only matching the RegressionTests schema."
             ),
             fallback=_fallback_tests,
         ),
@@ -846,8 +1192,15 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
             output_model=CandidatePatches,
             system_prompt=(
-                "Use the Pass 1 logs plus the new regression test to produce exactly two distinct "
-                "candidate unified diffs. Return JSON only."
+                  "You are an expert software engineer generating patches for a production incident. "
+        "You receive Pass 1 Docker logs showing the failure and a regression test showing the "
+        "expected correct behavior. "
+        "Generate exactly two distinct candidate unified diffs in standard patch -p1 format. "
+        "Each candidate must: target a different root cause hypothesis or fix strategy, "
+        "be a minimal focused change — no refactors, no unrelated cleanup, "
+        "make the regression test pass if applied correctly. "
+        "The two candidates must differ meaningfully — not just whitespace or variable names. "
+        "Return JSON only matching the CandidatePatches schema."
             ),
             fallback=_fallback_fix,
         ),
@@ -860,8 +1213,17 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="gpt-4o",
             output_model=RCAReport,
             system_prompt=(
-                "Use the winning patch and passing validation logs to produce final RCA/Git JSON. "
-                "Return JSON only."
+                 "You are an SRE writing a formal root cause analysis and preparing a Git commit. "
+        "You receive the winning patch, validation logs confirming it passes, "
+        "and the full incident context from triage. "
+        "Produce: a concise RCA summary (what broke, why, how it was caught), "
+        "a git branch name in the format incident/<service>-<short-slug>, "
+        "a conventional commit message (fix: <what was fixed>), "
+        "the winning unified diff, "
+        "and a one-paragraph validation summary stating which candidate won and why. "
+        "Write for an audience of engineers and engineering managers. "
+        "Be factual — only reference what appears in the logs and patch. "
+        "Return JSON only matching the RCAReport schema."
             ),
             fallback=_fallback_rca,
         ),
