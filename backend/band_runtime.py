@@ -6,9 +6,9 @@ import os
 from typing import Any
 
 from dotenv import load_dotenv
-from thenvoi import Agent
-from thenvoi.config import load_agent_config
-from thenvoi.core.simple_adapter import SimpleAdapter
+from band import Agent
+from band.config import load_agent_config
+from band.core.simple_adapter import SimpleAdapter
 
 from backend.agent_loop import IncidentAgent, build_agents
 from backend.inference import InferenceClients

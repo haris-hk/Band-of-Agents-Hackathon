@@ -7,3 +7,8 @@ frontend/.next/
 frontend/node_modules/
 frontend/*.log
 agent_config.yaml
+venv/
+.venv/
+conda-env/
+band_incident_response.egg-info/
+agent_config.yaml.example
