@@ -8,18 +8,13 @@ from typing import TypeVar
 
 from pydantic import BaseModel, ValidationError
 
+from backend.configuration import load_project_env
+from backend.schemas import Provider
+
 try:
     from openai import AsyncOpenAI
 except ModuleNotFoundError:
     AsyncOpenAI = None  # type: ignore[assignment]
-
-try:
-    from dotenv import load_dotenv
-except ModuleNotFoundError:
-    def load_dotenv() -> None:
-        return None
-
-from backend.schemas import Provider
 
 T = TypeVar("T", bound=BaseModel)
 
@@ -43,7 +38,7 @@ class ProviderSettings:
 
     @classmethod
     def from_env(cls) -> "ProviderSettings":
-        load_dotenv()
+        load_project_env()
         return cls(
             live_llm_enabled=os.getenv("LIVE_LLM_ENABLED", "false").lower() == "true",
             max_run_usd=float(os.getenv("MAX_RUN_USD", "0")),
