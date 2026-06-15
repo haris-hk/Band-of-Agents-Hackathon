@@ -9,11 +9,24 @@ import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Callable
+
+from backend.agent_context import build_stage_prompt
+from backend.alert_normalize import normalize_alert
+from backend.alert_sanitize import public_alert
+from backend.docker_health import (
+    check_docker_available,
+    check_docker_smoke,
+    docker_unavailable_message,
+    humanize_docker_error,
+)
+from backend.fix_export import export_validated_fix
 from backend.git_output import push_fix_as_pr
+from backend.repo_access import ensure_repo_checkout, load_repo_files, resolve_safe_repo_path
 from pydantic import BaseModel
 
 from backend.agent_names import AGENT_DISPLAY_NAMES, agent_mention
-from backend.inference import InferenceClients
+from backend.inference import GuardrailBlocked, InferenceClients
+from backend.repo_stack import docker_fields_from_alert, enrich_alert_docker_from_repo
 from backend.schemas import (
     AgentEvent,
     AgentHandoff,
@@ -36,6 +49,23 @@ from backend.schemas import (
 Fallback = Callable[[IncidentState], BaseModel]
 
 DEFAULT_CONTAINER_TIMEOUT_SECONDS = 60
+MAX_CONTAINER_TIMEOUT_SECONDS = 600
+
+# Skip heavy dirs when copying host repo into containers (especially on Windows bind mounts).
+WORKSPACE_COPY_EXCLUDES: tuple[str, ...] = (
+    "venv",
+    ".venv",
+    "node_modules",
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".next",
+    "dist",
+    "build",
+    ".cursor",
+    "agent-transcripts",
+)
 MAX_VALIDATION_CANDIDATES = 2
 
 
@@ -59,7 +89,7 @@ class IncidentAgent:
     default_model: str
 
     async def run(self, state: IncidentState, llm: InferenceClients) -> BaseModel:
-        prompt = json.dumps(state.model_dump(mode="json"), separators=(",", ":"))
+        prompt = build_stage_prompt(state, self.stage)
         try:
             return await llm.json_call(
                 provider=self.provider,
@@ -68,6 +98,8 @@ class IncidentAgent:
                 user=prompt,
                 output_model=self.output_model,
             )
+        except GuardrailBlocked:
+            return self.fallback(state)
         except Exception as exc:
             state.errors.append(f"{self.name}: {exc}")
             return self.fallback(state)
@@ -75,26 +107,7 @@ class IncidentAgent:
     @property
     def model_name(self) -> str:
         return os.getenv(self.model_env) or self.default_model
-    
-    def load_repo_files(repo_path: str, max_files: int = 20) -> dict:
-        code_map = {}
 
-        for root, _, files in os.walk(repo_path):
-            for f in files:
-                if f.endswith((".py", ".ts", ".js", ".go", ".java")):
-                    full_path = os.path.join(root, f)
-
-                    try:
-                        with open(full_path, "r", encoding="utf-8") as file:
-                            code_map[full_path] = file.read()
-
-                    except Exception:
-                        continue
-
-                    if len(code_map) >= max_files:
-                        return code_map
-
-        return code_map
 
 @dataclass(frozen=True)
 class DockerSandboxConfig:
@@ -116,12 +129,15 @@ class DockerSandboxConfig:
         tests: RegressionTests | None = None,
     ) -> "DockerSandboxConfig":
         timeout = min(
-            _alert_int(
-                alert,
-                ("container_timeout_seconds", "docker_timeout_seconds"),
-                DEFAULT_CONTAINER_TIMEOUT_SECONDS,
+            max(
+                1,
+                _alert_int(
+                    alert,
+                    ("container_timeout_seconds", "docker_timeout_seconds"),
+                    DEFAULT_CONTAINER_TIMEOUT_SECONDS,
+                ),
             ),
-            DEFAULT_CONTAINER_TIMEOUT_SECONDS,
+            MAX_CONTAINER_TIMEOUT_SECONDS,
         )
         repo_path = Path(
             _alert_string(
@@ -287,12 +303,17 @@ class DockerContainerExecutor:
 
     def _copy_workspace(self) -> tuple[int, str]:
         workdir = self.config.workdir.rstrip("/") or "/workspace"
-        source = self.config.source_mount.rstrip("/") + "/."
-        destination = workdir.rstrip("/") + "/"
+        source = self.config.source_mount.rstrip("/")
+        exclude_flags = " ".join(
+            f"--exclude={shlex.quote(name)}" for name in WORKSPACE_COPY_EXCLUDES
+        )
         command = (
             f"rm -rf {shlex.quote(workdir)} && "
             f"mkdir -p {shlex.quote(workdir)} && "
-            f"cp -a {shlex.quote(source)} {shlex.quote(destination)}"
+            f"tar -C {shlex.quote(source)} {exclude_flags} -cf - . "
+            f"| tar -xf - -C {shlex.quote(workdir)} && "
+            f"find {shlex.quote(workdir)} -type f \\( -name '*.py' -o -name '*.patch' \\) "
+            f"-exec sed -i 's/\\r$//' {{}} +"
         )
         return self._exec("workspace-copy", command)
 
@@ -348,7 +369,8 @@ class DockerContainerExecutor:
             image=self.config.image,
             command=self.config.repro_command,
             exit_code=exit_code,
-            failure_observed=exit_code is not None and exit_code != 0 and error is None,
+            failure_observed=(exit_code is not None and exit_code != 0 and error is None)
+            or bool(error),
             logs=logs,
             stack_trace=logs,
             error=error,
@@ -374,6 +396,30 @@ class DockerContainerExecutor:
 
 async def run_repro_pass1(state: IncidentState, _plan: ReproPlan) -> ReproExecution:
     config = DockerSandboxConfig.from_alert(state.raw_alert.payload)
+    available, docker_error = await asyncio.to_thread(check_docker_available)
+    if not available:
+        message = docker_unavailable_message(docker_error)
+        return ReproExecution(
+            image=config.image,
+            command=config.repro_command,
+            failure_observed=False,
+            logs=message,
+            stack_trace=message,
+            error=message,
+        )
+
+    smoke_ok, smoke_error = await asyncio.to_thread(check_docker_smoke)
+    if not smoke_ok:
+        message = docker_unavailable_message(smoke_error)
+        return ReproExecution(
+            image=config.image,
+            command=config.repro_command,
+            failure_observed=False,
+            logs=message,
+            stack_trace=message,
+            error=message,
+        )
+
     executor = DockerContainerExecutor(config, f"repro-pass1-{state.run_id}")
     try:
         return await asyncio.wait_for(
@@ -402,7 +448,7 @@ async def run_repro_pass1(state: IncidentState, _plan: ReproPlan) -> ReproExecut
             failure_observed=False,
             logs=logs,
             stack_trace=logs,
-            error=str(exc),
+            error=humanize_docker_error(str(exc)),
         )
 
 
@@ -412,6 +458,36 @@ async def run_validation_swarm(
     tests: RegressionTests,
 ) -> ValidationSwarmResult:
     config = DockerSandboxConfig.from_alert(state.raw_alert.payload, tests)
+    available, docker_error = await asyncio.to_thread(check_docker_available)
+    if not available:
+        message = docker_unavailable_message(docker_error)
+        return ValidationSwarmResult(
+            results=[
+                PatchValidationResult(
+                    candidate_index=0,
+                    validation_passed=False,
+                    logs=message,
+                    error=message,
+                    patch_summary=patches.candidates[0].summary if patches.candidates else "",
+                )
+            ]
+        )
+
+    smoke_ok, smoke_error = await asyncio.to_thread(check_docker_smoke)
+    if not smoke_ok:
+        message = docker_unavailable_message(smoke_error)
+        return ValidationSwarmResult(
+            results=[
+                PatchValidationResult(
+                    candidate_index=0,
+                    validation_passed=False,
+                    logs=message,
+                    error=message,
+                    patch_summary=patches.candidates[0].summary if patches.candidates else "",
+                )
+            ]
+        )
+
     candidates = patches.candidates[:MAX_VALIDATION_CANDIDATES]
     task_to_job: dict[
         asyncio.Task[PatchValidationResult],
@@ -520,295 +596,69 @@ async def _terminate_pending_validations(
     return cancelled_results
 
 
-# class IncidentOrchestrator:
-#     transitions = {
-#         Stage.TRIAGE: Stage.REPRO,
-#         Stage.REPRO: Stage.TEST,
-#         Stage.TEST: Stage.FIX,
-#         Stage.FIX: Stage.VALIDATE,
-#         Stage.VALIDATE: Stage.RCA,
-#         Stage.RCA: Stage.DONE,
-#     }
+def _pipeline_steps() -> list[dict[str, str]]:
+    return [
+        {"stage": "triage", "label": "Triage alert"},
+        {"stage": "repro", "label": "Reproduce in Docker"},
+        {"stage": "test", "label": "Write regression test"},
+        {"stage": "fix", "label": "Generate fix candidates"},
+        {"stage": "validate", "label": "Validate patches in Docker"},
+        {"stage": "rca", "label": "Publish RCA report"},
+        {"stage": "push", "label": "Push branch and open PR"},
+    ]
 
-#     def __init__(self, llm: InferenceClients | None = None) -> None:
-#         self.llm = llm or InferenceClients()
-#         self.agents = build_agents()
 
-#     async def run(self, alert: dict[str, Any]) -> AsyncIterator[AgentEvent]:
-#         state = IncidentState(raw_alert=RawAlert(payload=alert))
-#         yield self._event(state, Stage.TRIAGE, "orchestrator", "queued", {"alert": alert})
-
-#         while state.current_stage not in {Stage.DONE, Stage.FAILED}:
-#             if state.steps_run >= state.max_steps:
-#                 state.current_stage = Stage.FAILED
-#                 yield self._event(
-#                     state,
-#                     Stage.FAILED,
-#                     "orchestrator",
-#                     "failed",
-#                     error="max_steps exceeded",
-#                 )
-#                 return
-
-#             if state.current_stage == Stage.VALIDATE:
-#                 async for event in self._run_validation_stage(state):
-#                     yield event
-#                 continue
-
-#             agent = self.agents[state.current_stage]
-#             yield self._event(state, agent.stage, agent.name, "active", self._stage_payload(state))
-
-#             output = await agent.run(state, self.llm)
-#             self._merge_output(state, agent.stage, output)
-
-#             if agent.stage == Stage.REPRO:
-#                 self._add_handoff(
-#                     state,
-#                     from_agent=agent.name,
-#                     to_agent="Repro Sandbox",
-#                     stage=Stage.REPRO,
-#                     mention="@repro-sandbox",
-#                     payload=output.model_dump(mode="json"),
-#                     summary="Repro plan handed to Docker sandbox for Pass 1 execution.",
-#                 )
-#                 yield self._event(
-#                     state,
-#                     Stage.REPRO,
-#                     agent.name,
-#                     "handoff",
-#                     {
-#                         "mention": "@repro-sandbox",
-#                         "to_agent": "Repro Sandbox",
-#                         "payload": output.model_dump(mode="json"),
-#                     },
-#                 )
-#                 yield self._event(
-#                     state,
-#                     Stage.REPRO,
-#                     "Repro Sandbox",
-#                     "active",
-#                     {"timeout_seconds": DEFAULT_CONTAINER_TIMEOUT_SECONDS},
-#                 )
-#                 state.repro_execution = await run_repro_pass1(
-#                     state,
-#                     output,  # type: ignore[arg-type]
-#                 )
-#                 yield self._event(
-#                     state,
-#                     Stage.REPRO,
-#                     "Repro Sandbox",
-#                     "complete",
-#                     state.repro_execution.model_dump(mode="json"),
-#                 )
-
-#             state.steps_run += 1
-#             next_stage = self.transitions[agent.stage]
-#             output_payload = self._output_payload(state, agent.stage, output)
-#             handoff_from = agent.name
-#             if agent.stage == Stage.REPRO:
-#                 handoff_from = "Repro Sandbox"
-#             self._add_handoff_if_needed(state, handoff_from, next_stage, output_payload)
-#             yield self._event(state, agent.stage, agent.name, "complete", output_payload)
-
-#             if next_stage != Stage.DONE:
-#                 next_agent_name, next_mention = self._next_agent_metadata(next_stage)
-#                 yield self._event(
-#                     state,
-#                     next_stage,
-#                     agent.name,
-#                     "handoff",
-#                     {
-#                         "mention": next_mention,
-#                         "to_agent": next_agent_name,
-#                         "payload": self._stage_payload(state),
-#                     },
-#                 )
-
-#             state.current_stage = next_stage
-
-#         yield self._event(
-#             state,
-#             Stage.DONE,
-#             "orchestrator",
-#             "done",
-#             {
-#                 "rca": state.rca.model_dump(mode="json") if state.rca else None,
-#                 "fix": state.fix.model_dump(mode="json") if state.fix else None,
-#                 "validation": (
-#                     state.validation.model_dump(mode="json") if state.validation else None
-#                 ),
-#             },
-#         )
-
-#     async def _run_validation_stage(self, state: IncidentState) -> AsyncIterator[AgentEvent]:
-#         yield self._event(
-#             state,
-#             Stage.VALIDATE,
-#             "Validation Swarm",
-#             "active",
-#             self._stage_payload(state),
-#         )
-#         if state.candidate_patches is None or state.tests is None:
-#             state.current_stage = Stage.FAILED
-#             yield self._event(
-#                 state,
-#                 Stage.FAILED,
-#                 "Validation Swarm",
-#                 "failed",
-#                 error="validation requires candidate patches and regression tests",
-#             )
-#             return
-
-#         state.validation = await run_validation_swarm(state, state.candidate_patches, state.tests)
-#         state.fix = state.validation.winning_patch
-#         state.steps_run += 1
-
-#         if state.fix is None:
-#             state.current_stage = Stage.FAILED
-#             yield self._event(
-#                 state,
-#                 Stage.FAILED,
-#                 "Validation Swarm",
-#                 "failed",
-#                 state.validation.model_dump(mode="json"),
-#                 error="no candidate patch passed validation",
-#             )
-#             return
-
-#         next_stage = self.transitions[Stage.VALIDATE]
-#         self._add_handoff_if_needed(
-#             state,
-#             "Validation Swarm",
-#             next_stage,
-#             state.validation.model_dump(mode="json"),
-#         )
-#         yield self._event(
-#             state,
-#             Stage.VALIDATE,
-#             "Validation Swarm",
-#             "complete",
-#             state.validation.model_dump(mode="json"),
-#         )
-#         next_agent_name, next_mention = self._next_agent_metadata(next_stage)
-#         yield self._event(
-#             state,
-#             next_stage,
-#             "Validation Swarm",
-#             "handoff",
-#             {
-#                 "mention": next_mention,
-#                 "to_agent": next_agent_name,
-#                 "payload": self._stage_payload(state),
-#             },
-#         )
-#         state.current_stage = next_stage
-
-#     def _merge_output(self, state: IncidentState, stage: Stage, output: BaseModel) -> None:
-#         if stage == Stage.TRIAGE:
-#             state.context = output  # type: ignore[assignment]
-#         elif stage == Stage.REPRO:
-#             state.repro = output  # type: ignore[assignment]
-#         elif stage == Stage.TEST:
-#             state.tests = output  # type: ignore[assignment]
-#         elif stage == Stage.FIX:
-#             state.candidate_patches = output  # type: ignore[assignment]
-#         elif stage == Stage.RCA:
-#             state.rca = output  # type: ignore[assignment]
-
-#     def _add_handoff_if_needed(
-#         self,
-#         state: IncidentState,
-#         from_agent: str,
-#         next_stage: Stage,
-#         payload: dict[str, Any],
-#     ) -> None:
-#         if next_stage == Stage.DONE:
-#             return
-#         next_agent_name, next_mention = self._next_agent_metadata(next_stage)
-#         self._add_handoff(
-#             state,
-#             from_agent=from_agent,
-#             to_agent=next_agent_name,
-#             stage=next_stage,
-#             mention=next_mention,
-#             payload=payload,
-#             summary=f"{from_agent} handed structured incident state to {next_agent_name}.",
-#         )
-
-#     def _add_handoff(
-#         self,
-#         state: IncidentState,
-#         *,
-#         from_agent: str,
-#         to_agent: str,
-#         stage: Stage,
-#         mention: str,
-#         payload: dict[str, Any],
-#         summary: str,
-#     ) -> None:
-#         state.band_thread.append(
-#             AgentHandoff(
-#                 from_agent=from_agent,
-#                 to_agent=to_agent,
-#                 stage=stage,
-#                 mention=mention,
-#                 payload=payload,
-#                 summary=summary,
-#             )
-#         )
-
-#     def _next_agent_metadata(self, stage: Stage) -> tuple[str, str]:
-#         if stage == Stage.VALIDATE:
-#             return "Validation Swarm", "@validation-swarm"
-#         agent = self.agents[stage]
-#         return agent.name, agent.mention
-
-#     def _event(
-#         self,
-#         state: IncidentState,
-#         stage: Stage,
-#         agent: str,
-#         status: str,
-#         payload: dict[str, Any] | None = None,
-#         error: str | None = None,
-#     ) -> AgentEvent:
-#         event = AgentEvent(
-#             run_id=state.run_id,
-#             stage=stage,
-#             agent=agent,
-#             status=status,  # type: ignore[arg-type]
-#             payload=payload or {},
-#             error=error,
-#         )
-#         state.events.append(event)
-#         return event
-
-#     def _stage_payload(self, state: IncidentState) -> dict[str, Any]:
-#         return {
-#             "context": state.context.model_dump(mode="json") if state.context else None,
-#             "repro": state.repro.model_dump(mode="json") if state.repro else None,
-#             "repro_execution": (
-#                 state.repro_execution.model_dump(mode="json") if state.repro_execution else None
-#             ),
-#             "tests": state.tests.model_dump(mode="json") if state.tests else None,
-#             "candidate_patches": (
-#                 state.candidate_patches.model_dump(mode="json") if state.candidate_patches else None
-#             ),
-#             "fix": state.fix.model_dump(mode="json") if state.fix else None,
-#             "validation": state.validation.model_dump(mode="json") if state.validation else None,
-#             "errors": state.errors,
-#         }
-
-#     def _output_payload(
-#         self,
-#         state: IncidentState,
-#         stage: Stage,
-#         output: BaseModel,
-#     ) -> dict[str, Any]:
-#         payload = output.model_dump(mode="json")
-#         if stage == Stage.REPRO and state.repro_execution:
-#             payload["repro_execution"] = state.repro_execution.model_dump(mode="json")
-#         return payload
+def _pipeline_agents() -> list[dict[str, str]]:
+    return [
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.TRIAGE],
+            "mention": agent_mention(Stage.TRIAGE),
+            "stage": Stage.TRIAGE.value,
+            "kind": "band",
+        },
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.REPRO],
+            "mention": agent_mention(Stage.REPRO),
+            "stage": Stage.REPRO.value,
+            "kind": "band",
+        },
+        {
+            "name": "Repro Sandbox",
+            "mention": "@repro-sandbox",
+            "stage": Stage.REPRO.value,
+            "kind": "infrastructure",
+        },
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.TEST],
+            "mention": agent_mention(Stage.TEST),
+            "stage": Stage.TEST.value,
+            "kind": "band",
+        },
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.FIX],
+            "mention": agent_mention(Stage.FIX),
+            "stage": Stage.FIX.value,
+            "kind": "band",
+        },
+        {
+            "name": "Validation Swarm",
+            "mention": "@validation-swarm",
+            "stage": Stage.VALIDATE.value,
+            "kind": "infrastructure",
+        },
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.RCA],
+            "mention": agent_mention(Stage.RCA),
+            "stage": Stage.RCA.value,
+            "kind": "band",
+        },
+        {
+            "name": "Orchestrator",
+            "mention": "@orchestrator",
+            "stage": "orchestrator",
+            "kind": "infrastructure",
+        },
+    ]
 
 
 class IncidentOrchestrator:
@@ -826,19 +676,38 @@ class IncidentOrchestrator:
         self.agents = build_agents()
 
     async def run(self, alert: dict[str, Any]) -> AsyncIterator[AgentEvent]:
+        alert = normalize_alert(alert)
         state = IncidentState(raw_alert=RawAlert(payload=alert))
-        yield self._event(state, Stage.TRIAGE, "orchestrator", "queued", {"alert": alert})
+        await self._prepare_repository(state, alert)
+
+        docker_ok, docker_message = await asyncio.to_thread(check_docker_available)
+
+        yield self._event(
+            state,
+            Stage.TRIAGE,
+            "orchestrator",
+            "queued",
+            {
+                "alert": public_alert(alert),
+                "pipeline": _pipeline_steps(),
+                "agents": _pipeline_agents(),
+                "run_id": str(state.run_id),
+                "docker_available": docker_ok,
+                "docker_message": docker_message,
+            },
+        )
+
+        if state.current_stage == Stage.FAILED:
+            async for event in self._finalize_run(state, alert):
+                yield event
+            return
 
         while state.current_stage not in {Stage.DONE, Stage.FAILED}:
             if state.steps_run >= state.max_steps:
                 state.current_stage = Stage.FAILED
-                yield self._event(
-                    state,
-                    Stage.FAILED,
-                    "orchestrator",
-                    "failed",
-                    error="max_steps exceeded",
-                )
+                state.errors.append("max_steps exceeded")
+                async for event in self._finalize_run(state, alert):
+                    yield event
                 return
 
             if state.current_stage == Stage.VALIDATE:
@@ -853,6 +722,7 @@ class IncidentOrchestrator:
             self._merge_output(state, agent.stage, output)
 
             if agent.stage == Stage.REPRO:
+                repro_config = DockerSandboxConfig.from_alert(state.raw_alert.payload)
                 self._add_handoff(
                     state,
                     from_agent=agent.name,
@@ -869,7 +739,9 @@ class IncidentOrchestrator:
                     "handoff",
                     {
                         "mention": "@repro-sandbox",
+                        "from_agent": agent.name,
                         "to_agent": "Repro Sandbox",
+                        "summary": "Repro plan handed to Docker sandbox for Pass 1 execution.",
                         "payload": output.model_dump(mode="json"),
                     },
                 )
@@ -878,19 +750,29 @@ class IncidentOrchestrator:
                     Stage.REPRO,
                     "Repro Sandbox",
                     "active",
-                    {"timeout_seconds": DEFAULT_CONTAINER_TIMEOUT_SECONDS},
+                    {"timeout_seconds": repro_config.timeout_seconds},
                 )
                 state.repro_execution = await run_repro_pass1(
                     state,
                     output,  # type: ignore[arg-type]
                 )
+                repro_status = "complete"
+                if state.repro_execution.error:
+                    repro_status = "failed"
+                    state.errors.append(f"repro: {state.repro_execution.error}")
+                    state.current_stage = Stage.FAILED
                 yield self._event(
                     state,
                     Stage.REPRO,
                     "Repro Sandbox",
-                    "complete",
+                    repro_status,  # type: ignore[arg-type]
                     state.repro_execution.model_dump(mode="json"),
+                    error=state.repro_execution.error,
                 )
+                if state.current_stage == Stage.FAILED:
+                    async for event in self._finalize_run(state, alert):
+                        yield event
+                    return
 
             state.steps_run += 1
             next_stage = self.transitions[agent.stage]
@@ -910,25 +792,64 @@ class IncidentOrchestrator:
                     "handoff",
                     {
                         "mention": next_mention,
+                        "from_agent": agent.name,
                         "to_agent": next_agent_name,
+                        "summary": (
+                            f"{agent.name} handed structured incident state to {next_agent_name}."
+                        ),
                         "payload": self._stage_payload(state),
                     },
                 )
 
             state.current_stage = next_stage
 
-        # ── NEW: push fix as a GitHub PR once RCA is complete ─────────────────
+        async for event in self._finalize_run(state, alert):
+            yield event
+
+    async def _finalize_run(
+        self,
+        state: IncidentState,
+        alert: dict[str, Any],
+    ) -> AsyncIterator[AgentEvent]:
+        if state.current_stage == Stage.FAILED:
+            if state.fix and not state.fix_export:
+                state.fix_export = await asyncio.to_thread(export_validated_fix, state)
+            yield self._event(
+                state,
+                Stage.FAILED,
+                "orchestrator",
+                "failed",
+                {
+                    "errors": state.errors,
+                    "repo_full_name": state.repo_full_name,
+                    "repo_path": state.repo_path,
+                    "fix": state.fix.model_dump(mode="json") if state.fix else None,
+                    "fix_export": state.fix_export,
+                    "tests": state.tests.model_dump(mode="json") if state.tests else None,
+                    "rca": state.rca.model_dump(mode="json") if state.rca else None,
+                },
+                error="; ".join(state.errors) if state.errors else "pipeline failed",
+            )
+            return
+
+        if state.fix:
+            state.fix_export = await asyncio.to_thread(export_validated_fix, state)
+
         pr_url: str | None = None
         pr_error: str | None = None
+        auto_pr = bool(alert.get("auto_pr"))
 
-        if state.rca and getattr(state.rca, "patch_unified_diff", None):
+        if auto_pr and state.rca and state.rca.patch_unified_diff and state.fix:
             try:
-                from backend.git_output import push_fix_as_pr
-                repo_path: str = state.raw_alert.payload.get("repo_path", "")
+                repo_path = state.repo_path or alert.get("repo_path", "")
                 pr_url = await push_fix_as_pr(state=state, repo_path=repo_path)
             except Exception as exc:
                 pr_error = str(exc)
-        # ── END NEW ───────────────────────────────────────────────────────────
+                state.errors.append(f"pr: {exc}")
+        elif state.rca and state.rca.patch_unified_diff and not auto_pr:
+            pr_error = "auto_pr disabled; patch available in RCA only"
+        elif auto_pr and not state.fix:
+            pr_error = "no validated fix to push"
 
         yield self._event(
             state,
@@ -941,11 +862,33 @@ class IncidentOrchestrator:
                 "validation": (
                     state.validation.model_dump(mode="json") if state.validation else None
                 ),
-                # ── NEW fields ─────────────────────────────────────────────
+                "repo_full_name": state.repo_full_name,
+                "branch": state.rca.git_branch if state.rca else None,
                 "pr_url": pr_url,
                 "pr_error": pr_error,
+                "errors": state.errors,
+                "fix_export": state.fix_export,
             },
         )
+
+    async def _prepare_repository(self, state: IncidentState, alert: dict[str, Any]) -> None:
+        repo_path, repo_error = await ensure_repo_checkout(alert)
+        state.repo_path = repo_path or None
+        state.repo_full_name = alert.get("repo_full_name")
+        if repo_path:
+            alert["repo_path"] = repo_path
+        if repo_error:
+            state.errors.append(f"repo: {repo_error}")
+            if alert.get("repo_url"):
+                state.current_stage = Stage.FAILED
+            return
+        try:
+            resolved = resolve_safe_repo_path(repo_path)
+            state.repo_files = await asyncio.to_thread(load_repo_files, resolved)
+            enrich_alert_docker_from_repo(alert, resolved)
+            state.raw_alert.payload.update(docker_fields_from_alert(alert))
+        except Exception as exc:
+            state.errors.append(f"repo_files: {exc}")
 
     async def _run_validation_stage(self, state: IncidentState) -> AsyncIterator[AgentEvent]:
         yield self._event(
@@ -957,6 +900,7 @@ class IncidentOrchestrator:
         )
         if state.candidate_patches is None or state.tests is None:
             state.current_stage = Stage.FAILED
+            state.errors.append("validation: missing candidate patches or regression tests")
             yield self._event(
                 state,
                 Stage.FAILED,
@@ -966,12 +910,28 @@ class IncidentOrchestrator:
             )
             return
 
+        if not state.candidate_patches.candidates:
+            state.current_stage = Stage.FAILED
+            state.errors.append(
+                "validation: no candidate patches to validate — enable LIVE_LLM_ENABLED "
+                "for real GitHub repositories"
+            )
+            yield self._event(
+                state,
+                Stage.FAILED,
+                "Validation Swarm",
+                "failed",
+                error="no candidate patches to validate",
+            )
+            return
+
         state.validation = await run_validation_swarm(state, state.candidate_patches, state.tests)
         state.fix = state.validation.winning_patch
         state.steps_run += 1
 
         if state.fix is None:
             state.current_stage = Stage.FAILED
+            state.errors.append("validation: no candidate patch passed validation")
             yield self._event(
                 state,
                 Stage.FAILED,
@@ -1004,7 +964,9 @@ class IncidentOrchestrator:
             "handoff",
             {
                 "mention": next_mention,
+                "from_agent": "Validation Swarm",
                 "to_agent": next_agent_name,
+                "summary": f"Validation Swarm handed validated fix to {next_agent_name}.",
                 "payload": self._stage_payload(state),
             },
         )
@@ -1235,18 +1197,32 @@ def _alert_value(state: IncidentState, key: str, default: str) -> str:
     return value if isinstance(value, str) else json.dumps(value)
 
 
+def _service_label(state: IncidentState) -> str:
+    alert = state.raw_alert.payload
+    short = alert.get("service_short")
+    if isinstance(short, str) and short.strip():
+        return short.strip()
+    return _alert_value(state, "service", "unknown-service")
+
+
 def _fallback_triage(state: IncidentState) -> IncidentContext:
+    service = _service_label(state)
+    severity_raw = _alert_value(state, "severity", "sev2").lower()
+    try:
+        severity = Severity(severity_raw)
+    except ValueError:
+        severity = Severity.SEV2
     return IncidentContext(
-        service=_alert_value(state, "service", "unknown-service"),
+        service=service,
         environment=_alert_value(state, "environment", "unknown"),
         error_signature=_alert_value(
             state,
             "error",
             _alert_value(state, "message", "unknown-error"),
         ),
-        severity=Severity.SEV2,
+        severity=severity,
         impact=_alert_value(state, "impact", "impact requires manual confirmation"),
-        suspected_components=[_alert_value(state, "service", "unknown-service")],
+        suspected_components=[service],
         evidence=[json.dumps(state.raw_alert.payload, separators=(",", ":"))],
     )
 
@@ -1267,16 +1243,64 @@ def _fallback_repro(state: IncidentState) -> ReproPlan:
     )
 
 
+def _demo_handler_rel_path(state: IncidentState) -> str | None:
+    service = _service_label(state)
+    slug = service.lower().replace("-", "_")
+    candidates = [
+        "services/checkout/handler.py",
+        f"services/{service}/handler.py",
+        f"services/{slug}/handler.py",
+    ]
+    seen: set[str] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        if path in state.repo_files:
+            return path
+        if state.repo_path:
+            if (Path(state.repo_path) / path).is_file():
+                return path
+    return None
+
+
+def _placeholder_patch(index: int) -> CodePatch:
+    return CodePatch(
+        summary=f"Candidate {index + 1}: LLM required for repository-specific fix.",
+        files_changed=[],
+        patch_unified_diff=(
+            f"--- a/placeholder_{index}.txt\n"
+            f"+++ b/placeholder_{index}.txt\n"
+            f"@@ -1 +1 @@\n"
+            f"-before\n"
+            f"+after{index}\n"
+        ),
+        risk_notes=["Generated because LIVE_LLM_ENABLED=false and no demo handler exists."],
+        rollback_plan="No changes applied.",
+    )
+
+
 def _fallback_fix(state: IncidentState) -> CandidatePatches:
-    service = state.context.service if state.context else "service"
+    handler_path = _demo_handler_rel_path(state)
+    if handler_path is None:
+        state.errors.append(
+            "fix: no LLM and this repository is not the demo Python layout "
+            "(services/<service>/handler.py). Set LIVE_LLM_ENABLED=true in .env "
+            "and MAX_RUN_USD>0 for real GitHub projects."
+        )
+        return CandidatePatches(
+            candidates=[_placeholder_patch(0), _placeholder_patch(1)],
+        )
+
+    service = handler_path.split("/")[1] if "/" in handler_path else "service"
     candidates = [
         CodePatch(
             summary=(
                 f"Candidate {index + 1}: add defensive validation around failing path "
                 f"in {service}."
             ),
-            files_changed=[f"services/{service}/handler.py"],
-            patch_unified_diff=_fallback_patch_diff(service, index),
+            files_changed=[handler_path],
+            patch_unified_diff=_fallback_patch_diff(handler_path, index),
             risk_notes=["Placeholder patch; replace with repository-specific diff after repro."],
             rollback_plan="Revert the patch commit and redeploy the previous stable artifact.",
         )
@@ -1285,7 +1309,7 @@ def _fallback_fix(state: IncidentState) -> CandidatePatches:
     return CandidatePatches(candidates=candidates)
 
 
-def _fallback_patch_diff(service: str, index: int) -> str:
+def _fallback_patch_diff(handler_path: str, index: int) -> str:
     guard_message = [
         "payload is required",
         "payload cannot be empty",
@@ -1293,10 +1317,11 @@ def _fallback_patch_diff(service: str, index: int) -> str:
         "invalid payload",
         "payload validation failed",
     ][index]
+    path = handler_path
     return (
-        f"--- a/services/{service}/handler.py\n"
-        f"+++ b/services/{service}/handler.py\n"
-        "@@\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -8,1 +8,3 @@\n"
         "-    result = process(payload)\n"
         "+    if payload is None:\n"
         f"+        raise ValueError('{guard_message}')\n"

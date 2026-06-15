@@ -154,7 +154,7 @@ class AgentEvent(BaseModel):
 class IncidentState(BaseModel):
     run_id: UUID = Field(default_factory=uuid4)
     current_stage: Stage = Stage.TRIAGE
-    max_steps: int = 6
+    max_steps: int = 8
     steps_run: int = 0
     raw_alert: RawAlert
     context: IncidentContext | None = None
@@ -170,6 +170,8 @@ class IncidentState(BaseModel):
     errors: list[str] = Field(default_factory=list)
     repo_path: str | None = None
     repo_full_name: str | None = None
+    repo_files: dict[str, str] = Field(default_factory=dict)
+    fix_export: dict[str, Any] | None = None
 
 
 class RunRequest(BaseModel):

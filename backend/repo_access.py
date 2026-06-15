@@ -1,0 +1,192 @@
+from __future__ import annotations
+
+import asyncio
+import os
+import subprocess
+from pathlib import Path
+from typing import Any
+
+from backend.git_output import resolve_github_token
+
+_CODE_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rs", ".rb")
+_SKIP_DIRS = {
+    ".git",
+    ".venv",
+    "venv",
+    "node_modules",
+    "__pycache__",
+    ".next",
+    "dist",
+    "build",
+    ".ruff_cache",
+    ".pytest_cache",
+}
+
+
+def repos_root() -> Path:
+    return Path(
+        os.getenv("REPOS_ROOT", Path.home() / ".band-repos")
+    ).expanduser().resolve()
+
+
+def resolve_safe_repo_path(path: str | Path, *, repos_root_path: Path | None = None) -> Path:
+    """Resolve repo_path inside REPOS_ROOT or the current project directory."""
+    candidate = Path(path).expanduser()
+    if not candidate.is_absolute():
+        candidate = (Path.cwd() / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
+
+    allowed_roots = [repos_root_path or repos_root(), Path.cwd().resolve()]
+    if not any(_is_relative_to(candidate, root) for root in allowed_roots):
+        raise ValueError(f"repo_path must be under an allowed root: {candidate}")
+    if not candidate.exists():
+        raise FileNotFoundError(f"repo_path does not exist: {candidate}")
+    if not candidate.is_dir():
+        raise NotADirectoryError(f"repo_path is not a directory: {candidate}")
+    return candidate
+
+
+def _is_relative_to(path: Path, root: Path) -> bool:
+    try:
+        path.relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def load_repo_files(
+    repo_path: str | Path,
+    *,
+    max_files: int = 25,
+    max_bytes_per_file: int = 12_000,
+) -> dict[str, str]:
+    """Load a bounded slice of repository source for LLM context."""
+    root = Path(repo_path).resolve()
+    code_map: dict[str, str] = {}
+
+    for dirpath, dirnames, filenames in os.walk(root):
+        dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
+        for filename in filenames:
+            if not filename.endswith(_CODE_EXTENSIONS):
+                continue
+            full_path = Path(dirpath) / filename
+            try:
+                rel = full_path.relative_to(root).as_posix()
+            except ValueError:
+                continue
+            try:
+                raw = full_path.read_bytes()
+            except OSError:
+                continue
+            if len(raw) > max_bytes_per_file:
+                text = raw[:max_bytes_per_file].decode("utf-8", errors="replace")
+                text += "\n... [truncated]"
+            else:
+                text = raw.decode("utf-8", errors="replace")
+            code_map[rel] = text
+            if len(code_map) >= max_files:
+                return code_map
+
+    return code_map
+
+
+def _clone_repo(repo_url: str, destination: Path, token: str | None, commit_sha: str | None) -> None:
+    destination.parent.mkdir(parents=True, exist_ok=True)
+
+    clone_url = repo_url
+    if token and clone_url.startswith("https://github.com/"):
+        clone_url = clone_url.replace(
+            "https://github.com/",
+            f"https://x-access-token:{token}@github.com/",
+            1,
+        )
+
+    if destination.exists() and (destination / ".git").is_dir():
+        _run_git(["git", "fetch", "--prune", "origin"], destination, token)
+        base = os.getenv("GITHUB_PR_BASE_BRANCH", "main")
+        _run_git(["git", "checkout", base], destination, token)
+        _run_git(["git", "pull", "origin", base], destination, token)
+        if commit_sha:
+            _run_git(["git", "checkout", commit_sha], destination, token)
+        return
+
+    if destination.exists():
+        raise FileExistsError(f"destination exists but is not a git repo: {destination}")
+
+    subprocess.run(
+        ["git", "clone", "--depth", "1", clone_url, str(destination)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    if commit_sha:
+        _run_git(["git", "fetch", "--depth", "1", "origin", commit_sha], destination, token)
+        _run_git(["git", "checkout", commit_sha], destination, token)
+
+
+def _run_git(cmd: list[str], cwd: Path, token: str | None) -> None:
+    env = os.environ.copy()
+    if token:
+        env["GIT_TERMINAL_PROMPT"] = "0"
+    subprocess.run(cmd, cwd=cwd, check=True, capture_output=True, text=True, env=env)
+
+
+async def ensure_repo_checkout(alert: dict[str, Any]) -> tuple[str, str | None]:
+    """
+    Ensure alert['repo_path'] exists. Clone from repo_url when missing.
+    Returns (repo_path, error_message).
+    """
+    repo_path = alert.get("repo_path")
+    if not repo_path:
+        return "", "repo_path is missing after normalization"
+
+    try:
+        resolved = resolve_safe_repo_path(repo_path)
+        return str(resolved), None
+    except FileNotFoundError:
+        pass
+    except (ValueError, NotADirectoryError) as exc:
+        return str(repo_path), str(exc)
+
+    repo_url = alert.get("repo_url")
+    repo_full_name = alert.get("repo_full_name")
+    if not repo_url:
+        return str(repo_path), f"repository not found at {repo_path} and repo_url is missing"
+
+    destination = Path(repo_path).expanduser()
+    if not destination.is_absolute():
+        destination = (Path.cwd() / destination).resolve()
+    else:
+        destination = destination.resolve()
+
+    allowed_roots = [repos_root(), Path.cwd().resolve()]
+    if not any(_is_relative_to(destination, root) for root in allowed_roots):
+        return str(repo_path), f"repo_path not allowed: {destination}"
+
+    token: str | None = None
+    alert_token = alert.get("github_token")
+    if isinstance(alert_token, str) and alert_token.strip():
+        token = alert_token.strip()
+    elif repo_full_name:
+        try:
+            token = resolve_github_token(repo_full_name, None)
+        except ValueError:
+            token = os.getenv("GITHUB_TOKEN")
+
+    try:
+        await asyncio.to_thread(
+            _clone_repo,
+            repo_url,
+            destination,
+            token,
+            alert.get("commit_sha"),
+        )
+        resolved = resolve_safe_repo_path(destination)
+        return str(resolved), None
+    except subprocess.CalledProcessError as exc:
+        detail = (exc.stderr or exc.stdout or str(exc)).strip()
+        return str(repo_path), f"git clone failed: {detail}"
+    except Exception as exc:
+        return str(repo_path), str(exc)

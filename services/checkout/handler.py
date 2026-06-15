@@ -6,5 +6,5 @@ def process(payload: dict[str, object]) -> dict[str, object]:
 
 
 def handle(payload: dict[str, object] | None) -> dict[str, object]:
-    result = process(payload)  # type: ignore[arg-type]
+    result = process(payload)
     return {"ok": True, "result": result}
