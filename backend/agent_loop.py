@@ -524,15 +524,18 @@ def _docker_verify_patch(
 
     logs: list[str] = []
     try:
+        from pathlib import Path
+        abs_repo_path = str(Path(repo_path).resolve())
         client = docker_module.from_env()
         container = client.containers.run(
             docker_image,
             command="sleep 120",
             detach=True,
             working_dir="/",
-            volumes={repo_path: {"bind": "/workspace_src", "mode": "ro"}},
+            volumes={abs_repo_path: {"bind": "/workspace_src", "mode": "ro"}},
             labels={"band.incident_response": "true", "band.preflight": "true"},
         )
+
         try:
             # Copy workspace
             exclude_flags = " ".join(
