@@ -1,218 +1,386 @@
-# Band-of-Agents - Project Report
+# Band-of-Agents - Current Codebase Report
 
-Generated: 2026-06-14
+Generated: 2026-06-16
 
-**Product Description**
-- **Summary:** Multi-agent incident response system for alert triage, Docker-based reproduction, regression test generation, patch generation, sandbox validation, and RCA/Git output.
-- **Runtime shape:** The local FastAPI orchestrator now runs a Best-of-N validation architecture with N=2 candidate patches. It uses the Python Docker SDK for local sandbox execution and keeps Band/thenvoi integration available for stage-agent operation.
-- **Provider strategy:** The orchestrator supports per-agent model routing through environment-selected model names while preserving the existing `agent.run()` style abstraction.
+## Overview
 
-**Current Implementation**
-- **Backend service:** `backend/main.py` exposes `/ws/incidents` over WebSocket and streams `AgentEvent` updates from `IncidentOrchestrator`.
-- **Orchestrator:** `backend/agent_loop.py` now runs `triage -> repro -> test -> patch -> validate -> rca`.
-- **Docker execution:** Repro Pass 1 and validation jobs use local Docker containers through the Python Docker SDK.
-- **Validation swarm:** The validation stage runs up to 2 concurrent Docker containers, one per candidate patch. The first passing candidate wins and the remaining container is killed and removed.
-- **LLM clients:** `backend/inference.py` still centralizes JSON calls and spend guards, now with optional per-call model override support.
-- **Band runtime adapter:** `backend/band_runtime.py` preserves Band SDK agent creation and reorders stage handoff to match the new model-agent sequence.
-- **Schemas:** `backend/schemas.py` now models repro execution, candidate patches, validation results, winning patches, and RCA/Git metadata.
-- **Packaging:** `pyproject.toml` now includes `docker>=7.1.0`.
+Band-of-Agents is an incident response pipeline that accepts an alert, normalizes it, optionally clones or resolves a repository, reproduces the issue in Docker, writes a regression test, generates two candidate fixes, validates them in a concurrent Docker swarm, and publishes an RCA plus optional GitHub PR output. The current codebase has two execution paths:
 
-**Changes Made This Session**
-- Refactored `backend/agent_loop.py` from a linear patch/test flow into a Docker-backed incident pipeline.
-- Added `truncate_logs(log_string, max_lines=200)` and applied truncation to Docker stdout/stderr before logs enter downstream state.
-- Added Docker sandbox configuration and lifecycle helpers:
-  - Workspace mounted read-only from the host.
-  - Per-container isolated writable copy under `/workspace`.
-  - Optional setup command.
-  - Strict cleanup on normal completion, failures, and timeouts.
-- Added Repro Pass 1 execution:
-  - Runs one Docker container.
-  - Executes the configured repro command.
-  - Captures truncated logs and stack-trace text.
-  - Enforces the same 60 second container timeout policy.
-- Reordered the local orchestrator flow:
-  1. Alert Triager
-  2. Repro Planner
-  3. Repro Sandbox Pass 1
-  4. Regression Test Generator
-  5. Patch Generator
-  6. Validation Swarm
-  7. RCA Publisher
-- Updated Patch Generator behavior:
-  - It now asks for exactly 2 distinct candidate unified diffs.
-  - `CandidatePatches` enforces exactly 2 candidates.
-  - Fallback patch generation now emits 2 distinct diffs.
-- Updated Validation Swarm behavior:
-  - It slices candidates to `MAX_VALIDATION_CANDIDATES = 2`.
-  - It starts a maximum of 2 concurrent Docker validation jobs.
-  - It preserves fail-fast behavior: first `validation_passed: true` result wins.
-  - It preserves the 60 second timeout per validation container.
-  - It preserves loser cleanup by killing/removing pending containers after a winner.
-  - It preserves strict patch application using `patch --batch --forward --fuzz=0`.
-- Added RCA/Git output fields:
-  - `git_branch`
-  - `commit_message`
-  - `patch_unified_diff`
-  - `validation_summary`
-- Added per-agent model routing:
-  - `TRIAGE_MODEL`
-  - `REPRO_MODEL`
-  - `REGRESSION_TEST_MODEL`
-  - `PATCH_GENERATOR_MODEL`
-  - `RCA_MODEL`
-- Updated Band runtime ordering from `triage -> repro -> fix -> test -> rca` to `triage -> repro -> test -> fix -> rca`.
-- Added `docker>=7.1.0` to backend dependencies.
+- The FastAPI orchestrator in [backend/agent_loop.py](backend/agent_loop.py) drives the full repo -> fix -> validate -> RCA flow.
+- The Band SDK runtime in [backend/band_runtime.py](backend/band_runtime.py) keeps native agent-thread handoffs, but it does not run Docker validation or PR push.
 
-**Functional Features Completed**
-- **AlertTriager:** Fast/cheap model route by default via `TRIAGE_MODEL` or `gpt-4o-mini`.
-- **Repro Pass 1:** Medium model plans repro, then one Docker sandbox executes the failing command and captures truncated logs.
-- **RegressionTestGenerator:** Heavy/smart model route generates one strict pytest-style regression test from Pass 1 logs.
-- **PatchGenerator:** Heavy/smart model route generates exactly 2 distinct candidate unified diffs.
-- **Validation Swarm:** Async Best-of-2 Docker validation race with fail-fast cleanup.
-- **RCAPublisher:** Medium model route produces final RCA/Git JSON from the winning patch and validation logs.
-- **Event stream:** The orchestrator continues yielding `AgentEvent` updates for WebSocket consumers.
-- **Fallback behavior:** Existing no-live-LLM fallback path remains available, updated for the new two-candidate patch contract.
+## System Architecture
 
-**Non-Functional Features Completed**
-- **Strict log control:** Docker output is truncated to the last 200 lines before being stored or sent to later agents.
-- **Timeout safety:** Docker repro and validation jobs are bounded by a hard 60 second timeout.
-- **Container cleanup:** Containers are removed after normal execution and force-removed after failures, timeouts, or fail-fast cancellation.
-- **Strict diff application:** Validation uses the system `patch` command with no fuzzy matching.
-- **Typed state:** Pydantic schemas now cover repro execution, candidate patch batches, individual validation results, validation swarm results, and final RCA/Git output.
-- **Modular execution:** Docker sandbox concerns are isolated from agent prompting and state transition code.
+```mermaid
+flowchart LR
+  UI[Web UI / REST / WebSocket] --> N[normalize_alert]
+  N --> C[ensure_repo_checkout]
+  C --> T[Triager]
+  T --> R[Repro Planner]
+  R --> D[Docker Repro Sandbox]
+  D --> S[Regression Test Generator]
+  S --> F[Fix Generator]
+  F --> V[Validation Swarm]
+  V --> RCA[RCA Publisher]
+  RCA --> O[Export fix + optional PR]
+```
 
-**Potential Errors and Bugs (observed / likely)**
-- **Docker daemon availability:** The Docker SDK is installed, but local execution requires Docker Desktop or a reachable Docker daemon. A daemon ping during this session failed because the Windows Docker named pipe was unavailable.
-- **Container image assumptions:** The default image is `python:3.11-slim`. Repos that need system packages, project dependencies, or `patch` installed may require a custom image or `setup_command`.
-- **Patch path assumptions:** Unified diffs are applied with `patch -p1` by default. Alerts can override `patch_strip` if generated paths require a different strip level.
-- **Generated test path safety:** Test files are written into the container workspace. Unsafe absolute or parent-traversal paths are rejected.
-- **LLM gating:** If `LIVE_LLM_ENABLED=false`, every model call falls back to local placeholder behavior.
-- **Credentials:** Missing provider API keys still allow client construction but live calls will fail.
-- **Band stage limitation:** `backend/band_runtime.py` still runs individual model stages through Band messages. Docker repro/validation is part of the local `IncidentOrchestrator` path, not the per-stage Band adapter path.
-- **No persistence:** Incident state, handoffs, validation logs, and RCA output are still in-memory only.
+The orchestrator lives in [backend/main.py](backend/main.py) and exposes the incident APIs. It receives an alert, normalizes it, and streams `AgentEvent` objects over WebSocket while the pipeline advances through `triage -> repro -> test -> fix -> validate -> rca -> done/failed`.
 
-**Status of Band Integration**
-- **Implemented:** `backend/band_runtime.py` still creates thenvoi `Agent` instances through `Agent.create(...)`.
-- **Updated:** Band model-stage order now follows `TRIAGE -> REPRO -> TEST -> FIX -> RCA`.
-- **Preserved:** Stage agents still use the standard `IncidentAgent.run(state, llm)` abstraction.
-- **Caveat:** The local Docker validation swarm is orchestrator-managed. Running only the Band stage agents does not by itself perform the local Docker validation stage.
+The code path is split into four layers:
 
-**System Architecture**
-- **Components:**
-  - **Frontend (Next.js):** submits sample alerts and renders event feed, RCA, and patch output.
-  - **Backend (FastAPI):** WebSocket entrypoint and orchestrator runtime.
-  - **Agent layer:** `IncidentAgent` definitions, prompts, fallbacks, and model routing.
-  - **Docker sandbox layer:** local container repro and validation execution.
-  - **Providers:** AIML and Featherless-compatible OpenAI clients.
-  - **Band/thenvoi:** optional agent runtime adapter.
-- **Dataflow:**
-  1. Alert arrives over WebSocket or Band message.
-  2. Alert Triager creates structured incident context.
-  3. Repro Planner creates repro expectations.
-  4. Repro Sandbox runs Pass 1 in Docker and truncates logs.
-  5. Regression Test Generator writes one strict test from Pass 1 logs.
-  6. Patch Generator emits exactly 2 distinct unified diffs.
-  7. Validation Swarm runs both candidates concurrently in Docker.
-  8. First passing patch wins; the other container is killed and removed.
-  9. RCA Publisher emits final RCA/Git JSON.
+- API and transport: [backend/main.py](backend/main.py)
+- Orchestration and Docker execution: [backend/agent_loop.py](backend/agent_loop.py)
+- Alert and repository shaping: [backend/alert_normalize.py](backend/alert_normalize.py), [backend/repo_access.py](backend/repo_access.py), [backend/repo_stack.py](backend/repo_stack.py)
+- Output/export and PR pushing: [backend/fix_export.py](backend/fix_export.py), [backend/git_output.py](backend/git_output.py)
 
-**Complete Process Workflow**
-- **1) Trigger:** Web UI or Band message provides JSON alert payload.
-- **2) TRIAGE:** `Alert Triager` extracts `IncidentContext`.
-- **3) REPRO:** `Repro Planner` produces `ReproPlan`.
-- **4) REPRO SANDBOX:** One Docker container executes the failing state and captures truncated logs.
-- **5) TEST:** `Regression Test Generator` produces one regression test.
-- **6) PATCH:** `Patch Generator` produces exactly 2 candidate unified diffs.
-- **7) VALIDATE:** Two Docker containers race candidate patches against the same regression test.
-- **8) FAIL-FAST:** First passing validation wins; the losing container is killed and removed.
-- **9) RCA:** `RCA Publisher` creates final RCA/Git JSON.
-- **10) Completion:** Final `done` event includes `rca`, `fix`, and `validation` payloads.
+## Directory Structure
 
-**Descriptions of Folders and Notable Functions**
-- **`backend/agent_loop.py`:**
-  - `truncate_logs(...)` keeps only the last 200 log lines.
-  - `DockerSandboxConfig` reads Docker settings from alert payload.
-  - `DockerContainerExecutor` starts containers, copies workspace, uploads tests/patches, runs commands, and cleans up.
-  - `run_repro_pass1(...)` runs one Docker repro container.
-  - `run_validation_swarm(...)` runs the async Best-of-2 validation race.
-  - `_run_validation_job(...)` enforces per-container timeout behavior.
-  - `_terminate_pending_validations(...)` kills/removes losing containers after a winner.
-  - `IncidentOrchestrator.run(...)` coordinates the full local pipeline.
-  - `build_agents()` defines model routing, prompts, output schemas, and fallbacks.
-- **`backend/schemas.py`:**
-  - Adds `ReproExecution`, `CandidatePatches`, `PatchValidationResult`, and `ValidationSwarmResult`.
-  - Extends `IncidentState` with repro execution, candidate patches, validation, and winning patch state.
-  - Extends `RCAReport` with Git and validation summary fields.
-- **`backend/inference.py`:**
-  - `InferenceClients.json_call(...)` accepts an optional `model` override per agent call.
-- **`backend/band_runtime.py`:**
-  - Updates Band stage order to `TRIAGE, REPRO, TEST, FIX, RCA`.
-- **`pyproject.toml`:**
-  - Adds `docker>=7.1.0`.
+- [backend/main.py](backend/main.py) - FastAPI app, `/health`, `/metrics`, `/demo/alert`, `/incidents`, `/ws/incidents`, fix/report download endpoints.
+- [backend/agent_loop.py](backend/agent_loop.py) - core orchestrator, fallback agents, Docker sandbox executor, validation swarm, and event emission.
+- [backend/schemas.py](backend/schemas.py) - all Pydantic models and enums for alerts, handoffs, events, validation, and RCA.
+- [backend/inference.py](backend/inference.py) - OpenAI-compatible client routing, spend/token guardrails, JSON-only generation.
+- [backend/alert_normalize.py](backend/alert_normalize.py) - normalizes webhook/UI/demo alerts into one contract.
+- [backend/repo_access.py](backend/repo_access.py) - repository checkout, safe path validation, bounded file loading.
+- [backend/repo_stack.py](backend/repo_stack.py) - stack detection and Docker defaults for demo Python, Python, and Node repos.
+- [backend/band_runtime.py](backend/band_runtime.py) - Band SDK adapter runtime and handoff envelopes.
+- [backend/fix_export.py](backend/fix_export.py) - persists patch/test artifacts and replication instructions, applies patch to the host repo when possible.
+- [backend/git_output.py](backend/git_output.py) - branch creation, commit, push, and PR creation.
+- [frontend/app/page.tsx](frontend/app/page.tsx) - Next.js incident console, WebSocket client, and local demo/GitHub input forms.
+- [frontend/components/](frontend/components/) - chat, changes, input, and report panes.
+- [frontend/lib/](frontend/lib/) - event grouping, chat rendering, and unified-diff parsing.
+- [scripts/start.ps1](scripts/start.ps1) / [scripts/start.sh](scripts/start.sh) - local launcher scripts.
+- [tests/](tests/) - orchestration, guardrail, Docker, API, and UI regression tests.
+- [BAND_RUNTIME.md](BAND_RUNTIME.md) - short comparison of the Band runtime vs the FastAPI orchestrator.
 
-**How to Run (local development)**
-1. Create a Python virtualenv:
-   - `python -m venv .venv`
-   - `.venv\Scripts\activate`
-2. Install backend dependencies:
-   - `pip install -e .`
-3. Start Docker Desktop or otherwise expose a Docker daemon to the Python Docker SDK.
-4. Run backend:
-   - `uvicorn backend.main:app --reload --host 0.0.0.0 --port 8000`
-5. Install and run frontend:
-   - `cd frontend`
-   - `npm install`
-   - `npm run dev`
-6. Open `http://localhost:3000`.
-7. To run Band agents:
-   - Configure thenvoi agent IDs/API keys.
-   - Set `THENVOI_WS_URL` and `THENVOI_REST_URL`.
-   - Run `python -m backend.band_runtime`.
+## Band Integration
 
-**Alert Payload Runtime Options**
-- `docker_image` / `container_image` / `image`: Docker image to run.
-- `repo_path` / `repository_path` / `workspace_path`: host repository path mounted into containers.
-- `container_workdir` / `workdir`: container workspace path, default `/workspace`.
-- `setup_command`: optional setup command before repro or validation.
-- `repro_command` / `failing_command` / `test_command`: command used by Pass 1 repro.
-- `validation_command`: optional command overriding generated test run command for Pass 2.
-- `patch_strip`: `patch -pN` strip level, default `1`.
-- `container_timeout_seconds` / `docker_timeout_seconds`: timeout capped at 60 seconds.
-- `docker_network_disabled` / `network_disabled`: disables container networking when true.
+Current status:
 
-**Environment / Required Variables**
-- `LIVE_LLM_ENABLED`: true/false to permit live LLM calls.
-- `AIML_API_KEY`, `FEATHERLESS_API_KEY`: provider API keys.
-- `AIML_BASE_URL`, `FEATHERLESS_BASE_URL`: optional provider base URL overrides.
-- `MAX_RUN_USD`, `MAX_AGENT_TOKENS`: spend and token controls.
-- `TRIAGE_MODEL`: default `gpt-4o-mini`.
-- `REPRO_MODEL`: default `gpt-4o`.
-- `REGRESSION_TEST_MODEL`: default `gpt-4o`.
-- `PATCH_GENERATOR_MODEL`: default `Qwen/Qwen2.5-Coder-32B-Instruct`.
-- `RCA_MODEL`: default `gpt-4o`.
-- `THENVOI_WS_URL`, `THENVOI_REST_URL`: Band/thenvoi runtime configuration.
+- Band integration is present and functional for native agent-thread handoffs.
+- The Band path is intentionally narrower than the orchestrator path: it stops after RCA and does not execute Docker validation or push a PR.
+- The orchestrator remains the authoritative path for the full validation pipeline.
 
-**Verification Performed**
-- `python -m compileall backend` passed.
-- Import/schema smoke test passed for:
-  - `truncate_logs(...)`
-  - fallback generation of exactly 2 distinct candidate patches
-  - Pydantic construction of updated models
-- Docker SDK import succeeded with installed version `7.1.0`.
-- Docker daemon ping failed in this session because the Windows Docker named pipe was not available.
-- `git diff --check` passed.
+Exact adapter usage in [backend/band_runtime.py](backend/band_runtime.py):
 
-**Changed Files**
-- `backend/agent_loop.py`
-- `backend/band_runtime.py`
-- `backend/inference.py`
-- `backend/schemas.py`
-- `pyproject.toml`
-- `REPORT.md`
+- `create_band_agents()` loads stage agent IDs from `agent_config.yaml` via `load_agent_config(...)`.
+- It creates one `band.Agent` per stage with `Agent.create(adapter=CustomAdapter(...), agent_id=..., api_key=..., ws_url=..., rest_url=...)`.
+- `CustomAdapter.on_message(...)` parses inbound JSON, reconstructs or initializes `IncidentState`, calls the stage agent through `IncidentAgent.run(...)`, merges the output back into state, and sends a JSON handoff payload to the next mention.
+- The Band stage order is `TRIAGE -> REPRO -> TEST -> FIX -> RCA`.
+- `_merge_stage_output(...)` stores `context`, `repro`, `tests`, `candidate_patches`, `fix`, and `rca` back onto the shared state.
+- The payload envelope uses `message_type: "band.handoff.v1"` and includes `stage`, `agent`, `payload`, and `state`.
 
-**Next Steps & Recommendations**
-- Start Docker Desktop and run a real end-to-end validation using a small sample repo and known patch.
-- Add unit tests for `truncate_logs`, candidate schema validation, safe test path handling, and swarm fail-fast behavior.
-- Add a mocked Docker client test to verify loser cleanup without requiring a live daemon.
-- Add persistent storage for incident state, validation logs, RCA output, and selected winning patches.
-- Decide whether winning patches should become human-reviewed PRs or automated commits.
+Practical limitation:
+
+- Docker repro, Docker validation, and PR push are handled by the orchestrator path, not the Band runtime path.
+
+## Sample Workflow
+
+1. A client sends an alert to `POST /incidents` or opens `WebSocket /ws/incidents` with `{ "alert": { ... } }`.
+2. [backend/alert_normalize.py](backend/alert_normalize.py) coerces the alert into one shape, fills defaults, and derives `repo_path`, `repo_url`, `service_short`, `severity`, `impact`, and `auto_pr`.
+3. [backend/repo_access.py](backend/repo_access.py) resolves or clones the repository when a `repo_url` is available.
+4. [backend/repo_stack.py](backend/repo_stack.py) detects demo Python, Python, or Node layout and injects Docker defaults such as `docker_image`, `setup_command`, `repro_command`, and `validation_command` when the alert did not already supply them.
+5. The orchestrator emits a `queued` event and begins triage.
+6. The triager returns `IncidentContext`.
+7. The repro agent returns `ReproPlan`; then `run_repro_pass1(...)` executes the command in a Docker container and records `ReproExecution`.
+8. The test agent returns `RegressionTests`.
+9. The fix stage returns exactly two candidate patches in `CandidatePatches`.
+10. The validation swarm applies each patch in a separate Docker container, runs the build/test command, and keeps the first passing candidate.
+11. The RCA agent produces `RCAReport` with the winning patch, validation summary, and final markdown.
+12. Finalization exports `fix.patch`, the regression test, and `REPLICATE.md`; if `auto_pr` is enabled and GitHub credentials are present, it can also open a PR.
+
+## Tech Stack & Dependencies
+
+Backend:
+
+| Component | Current version / dependency |
+|---|---|
+| Python | `>= 3.11` |
+| FastAPI | `fastapi>=0.115.0` |
+| Uvicorn | `uvicorn[standard]>=0.32.0` |
+| Docker SDK | `docker>=7.1.0` |
+| Pydantic | `pydantic>=2.9.0` |
+| OpenAI-compatible client | `openai>=1.55.0` |
+| dotenv loader | `python-dotenv>=1.0.1` |
+| GitHub API | `PyGithub>=2.1.0` |
+| Band SDK | `band-sdk>=1.0.0` |
+
+Frontend:
+
+| Component | Current version / dependency |
+|---|---|
+| Next.js | `15.2.4` |
+| React | `19.0.0` |
+| React DOM | `19.0.0` |
+| TypeScript | `5.8.2` |
+
+Install:
+
+```bash
+pip install -e ".[dev]"
+cd frontend
+npm install
+```
+
+## Agent Handoff Data Contracts
+
+### Core pipeline models
+
+| Stage | Input | Output model | Exact fields |
+|---|---|---|---|
+| Triage | `RunRequest.alert: dict[str, Any]` | `IncidentContext` | `service: str`, `environment: str = "unknown"`, `error_signature: str`, `severity: Severity`, `impact: str`, `suspected_components: list[str] = []`, `evidence: list[str] = []`, `interpretations: list[str] = []`, `investigation_plan: list[str] = []` |
+| Repro planning | `IncidentContext` + repo files | `ReproPlan` | `confirmed: bool`, `assumptions: list[str] = []`, `steps: list[str]`, `expected_failure: str`, `required_data: list[str] = []` |
+| Repro execution | `ReproPlan` | `ReproExecution` | `image: str`, `command: str`, `exit_code: int | None = None`, `timed_out: bool = False`, `failure_observed: bool = False`, `logs: str = ""`, `stack_trace: str = ""`, `error: str | None = None` |
+| Test generation | `ReproExecution` + repo files | `RegressionTests` | `framework: str = "pytest"`, `test_files: list[str] = []`, `test_code: str`, `run_command: str = "pytest"`, `acceptance_criteria: list[str] = []` |
+| Fix generation | `RegressionTests` + repo files + repro logs | `CandidatePatches` | `candidates: list[CodePatch]` with exactly 2 items |
+| Patch shape | inside `CandidatePatches` | `CodePatch` | `summary: str`, `files_changed: list[str] = []`, `patch_unified_diff: str`, `risk_notes: list[str] = []`, `rollback_plan: str` |
+| Validation | `CandidatePatches` + `RegressionTests` | `PatchValidationResult` | `candidate_index: int`, `validation_passed: bool`, `timed_out: bool = False`, `exit_code: int | None = None`, `logs: str = ""`, `error: str | None = None`, `patch_summary: str | None = None` |
+| Validation aggregation | list of `PatchValidationResult` | `ValidationSwarmResult` | `winning_candidate_index: int | None = None`, `winning_patch: CodePatch | None = None`, `results: list[PatchValidationResult] = []` |
+| RCA | winning patch + validation + context | `RCAReport` | `title: str`, `incident_summary: str`, `customer_impact: str`, `root_cause: str`, `timeline: list[str] = []`, `remediation: list[str] = []`, `prevention: list[str] = []`, `git_branch: str | None = None`, `commit_message: str | None = None`, `patch_unified_diff: str | None = None`, `validation_summary: str | None = None`, `final_markdown: str` |
+
+### Shared wrappers
+
+| Model | Fields |
+|---|---|
+| `AgentHandoff` | `from_agent: str`, `to_agent: str`, `stage: Stage`, `mention: str`, `payload: dict[str, Any]`, `message_type: str = "band.handoff.v1"`, `summary: str | None = None`, `created_at: datetime = now(UTC)` |
+| `AgentEvent` | `run_id: UUID`, `stage: Stage`, `agent: str`, `status: Literal["queued", "active", "handoff", "complete", "failed", "done"]`, `payload: dict[str, Any] = {}`, `error: str | None = None`, `created_at: datetime = now(UTC)` |
+| `IncidentState` | `run_id`, `current_stage`, `max_steps = 8`, `steps_run = 0`, `raw_alert`, `context`, `repro`, `repro_execution`, `candidate_patches`, `fix`, `tests`, `validation`, `rca`, `band_thread`, `events`, `errors`, `repo_path`, `repo_full_name`, `repo_files`, `fix_export` |
+| `RunRequest` | `alert: dict[str, Any]` |
+| `RunResult` | `state: IncidentState` |
+
+### Stage order
+
+- Orchestrator: `triage -> repro -> test -> fix -> validate -> rca -> done/failed`
+- Band runtime: `triage -> repro -> test -> fix -> rca`
+
+## Runtime Configuration Table
+
+### Environment variables
+
+| Variable | Type | Default | Notes |
+|---|---|---|---|
+| `LIVE_LLM_ENABLED` | bool | `false` | Enables live JSON LLM calls. When `false`, model calls raise `GuardrailBlocked` and fallback logic is used. |
+| `MAX_RUN_USD` | float | `0` | Spend guard for a whole incident run. |
+| `MAX_RUN_TOKENS` | int | `4000` | Total token guard across the run. |
+| `REQUEST_TIMEOUT_SECONDS` | float | `20` | LLM request timeout per call. |
+| `MAX_PROMPT_TOKENS` | int | `2500` | Rejects prompts that are too large before a request is made. |
+| `MAX_AGENT_TOKENS` | int | `900` | Completion budget per LLM request. |
+| `AIML_MODEL` | string | `gpt-4o` | Default AIML provider model. |
+| `FEATHERLESS_MODEL` | string | `Qwen/Qwen2.5-Coder-32B-Instruct` | Default Featherless model. |
+| `AIML_BASE_URL` | string | `https://api.aimlapi.com/v1` | AIML-compatible endpoint. |
+| `FEATHERLESS_BASE_URL` | string | `https://api.featherless.ai/v1` | Featherless-compatible endpoint. |
+| `OPENROUTER_BASE_URL` | string | `https://openrouter.ai/api/v1` | OpenRouter-compatible endpoint. |
+| `OPENROUTER_MODEL` | string | `openai/gpt-oss-120b:free` | OpenRouter fallback model. |
+| `AIML_API_KEY` | string | missing | Primary AIML credential. |
+| `AIML_API_KEY_2` | string | falls back to `AIML_API_KEY` | Secondary AIML credential. |
+| `FEATHERLESS_API_KEY` | string | missing | Primary Featherless credential. |
+| `FEATHERLESS_API_KEY_2` | string | falls back to `FEATHERLESS_API_KEY` | Secondary Featherless credential. |
+| `OPENROUTER_API_KEY` | string | missing | OpenRouter credential. |
+| `TRIAGE_MODEL` | string | `gpt-4o-mini` | Per-agent override for triage. |
+| `REPRO_MODEL` | string | `Qwen/Qwen2.5-Coder-32B-Instruct` | Per-agent override for repro planning. |
+| `REGRESSION_TEST_MODEL` | string | `Qwen/Qwen2.5-Coder-32B-Instruct` | Per-agent override for test generation. |
+| `PATCH_GENERATOR_MODEL` | string | `Qwen/Qwen2.5-Coder-32B-Instruct` | Per-agent override for fix generation. |
+| `RCA_MODEL` | string | `openai/gpt-oss-120b:free` | Per-agent override for RCA generation. |
+| `SHARED_DEPLOYMENT` | bool | `false` | Forces shared-deployment checks. |
+| `REQUIRE_DOCKER` | bool | derived from `SHARED_DEPLOYMENT` | Overrides Docker-at-startup behavior when set. |
+| `INCIDENT_API_KEY` | string | unset | Protects `/incidents` and `/ws/incidents` when configured or in shared mode. |
+| `GITHUB_WEBHOOK_SECRET` | string | unset | Required in shared deployment and for webhook verification. |
+| `ENFORCE_GITHUB_WEBHOOK_SECRET` | bool | `false` | Forces webhook secret validation outside shared deployment. |
+| `CORS_ORIGINS` | CSV string | `http://localhost:3000,http://127.0.0.1:3000` | Allowed browser origins. |
+| `REPOS_ROOT` | path | `~/.band-repos` | Allowed root for repository checkouts. |
+| `RUNS_DIR` | path | `~/.band-runs` | Event-log and artifact output directory. |
+| `RUNS_PERSIST` | bool | `true` | Controls JSONL run-event persistence. |
+| `AUTO_PR_ENABLED` | bool | `false` | Default `auto_pr` for non-GitHub alerts. |
+| `GITHUB_TOKEN` | string | unset | Used for clone/push/PR flows when no per-alert token exists. |
+| `GITHUB_PR_BASE_BRANCH` | string | `main` | Base branch for clone/pull and PR creation. |
+| `GIT_BOT_NAME` | string | `Band Bot` | Git identity used for commits. |
+| `GIT_BOT_EMAIL` | string | `bot@users.noreply.github.com` | Git identity used for commits. |
+| `BAND_USERNAME` | string | empty | Used when deriving Band participant names. |
+| `REPO_PATH` | path | current working directory | Default repo path for Band runtime state creation. |
+| `REPO_FULL_NAME` | string | empty | Default GitHub owner/repo for Band runtime state creation. |
+| `THENVOI_WS_URL` | string | `wss://app.band.ai/api/v1/socket/websocket` | Band websocket endpoint. |
+| `THENVOI_REST_URL` | string | `https://app.band.ai` | Band REST endpoint. |
+| `NEXT_PUBLIC_API_URL` | string | `http://localhost:8000` | Frontend API base URL. |
+| `NEXT_PUBLIC_INCIDENT_API_KEY` | string | empty | Frontend-auth header/query value for the websocket. |
+
+### Alert payload keys
+
+| Key | Type | Default / alias behavior | Notes |
+|---|---|---|---|
+| `service` | string | derived from repo or `unknown-service` | Primary service identifier. |
+| `service_short` | string | derived from `repo_full_name` or `service` | Leaf service name used in UI and triage. |
+| `repo_full_name` | string | derived from `repo_url` / `service` | GitHub `owner/repo`. |
+| `repo_url`, `repository_url`, `github_url`, `repo_link`, `repository` | string | derived from `repo_full_name` when possible | Accepted aliases for repository location. |
+| `repo_path` | string | derived from `REPOS_ROOT` + repo name or service | Local checkout path. |
+| `error`, `error_message`, `message`, `title`, `error_details`, `body`, `text` | string | `unknown-error` | Free-text incident description. |
+| `severity` | string | `sev2` | Normalized to `sev1`/`sev2`/`sev3`/`sev4`. |
+| `environment` | string | `unknown` | Typically `production`, `staging`, `ci`, `demo`, or `unknown`. |
+| `impact` | string | `impact requires confirmation` | Customer impact description. |
+| `auto_pr` | bool | `true` for GitHub flow, otherwise `AUTO_PR_ENABLED` | Controls PR push in finalization. |
+| `github_token` | string | unset | Per-incident override for clone/push. |
+| `commit_sha` | string | unset | Optional checkout pin. |
+| `docker_image`, `container_image`, `image` | string | derived by repo stack or `python:3.11-slim` | Container image for repro/validation. |
+| `container_workdir`, `workdir` | string | `/workspace` | Writable working directory inside the container. |
+| `source_mount` | string | `/workspace_src` | Read-only host mount point inside the container. |
+| `setup_command`, `docker_setup_command` | string | repo- or alert-derived default | Prep command before repro/validation. |
+| `repro_command`, `failing_command`, `test_command` | string | `pytest` or repo-derived command | Docker repro command. |
+| `validation_command` | string | falls back to regression test run command | Validation command when not inferred. |
+| `build_command` | string | auto-detected or unset | Optional compile/build pass during validation. |
+| `patch_strip` | int | `1` | `patch -pN` strip level. |
+| `container_timeout_seconds`, `docker_timeout_seconds` | int | `60`, capped to `1..600` | Hard timeout per Docker container. |
+| `docker_network_disabled`, `network_disabled` | bool | `false` | Disables container networking when true. |
+
+## Docker Sandbox & Mount Mechanics
+
+The Docker execution model is deliberately conservative:
+
+- The host repository is mounted read-only into the container at `source_mount`, which defaults to `/workspace_src`.
+- The container gets a separate writable copy under `workdir`, which defaults to `/workspace`.
+- The working copy is built by tar-copying the mounted source into `/workspace` and stripping CRLF line endings in place.
+- Heavy directories are excluded from the copy: `.git`, `venv`, `.venv`, `node_modules`, `__pycache__`, `.pytest_cache`, `.ruff_cache`, `.next`, `dist`, `build`, `.cursor`, and `agent-transcripts`.
+- Containers are launched as `sleep 3600` jobs and are always removed after the step finishes or times out.
+- Repro and validation steps execute through `sh -lc` inside the container.
+- Patch application uses `patch --batch --forward --fuzz=3 -pN` first, then retries without fuzz if needed.
+- The default strip level is `patch_strip = 1`, but alerts can override it.
+- `_safe_relative_container_path(...)` strips a leading `/workspace/` prefix, rejects absolute paths, rejects `..`, and rejects path segments containing `:`.
+- Alert paths that already point inside the container workdir are normalized back to container-relative paths before file upload.
+- Container timeouts are clamped to `1..600` seconds, with a default of 60 seconds.
+
+Repository stack detection in [backend/repo_stack.py](backend/repo_stack.py):
+
+- `services/checkout/handler.py` present -> `demo-python`
+- `package.json` present -> `node`
+- `pyproject.toml`, `requirements.txt`, or `setup.py` present -> `python`
+
+Those heuristics inject image/command defaults automatically when the alert did not already specify a Docker configuration.
+
+## WebSocket Event Stream Spec
+
+The websocket endpoint is [backend/main.py](backend/main.py)'s `WebSocket /ws/incidents`. The browser sends `{"alert": {...}}` to start a run and may also send `{"type": "pong"}` in response to server heartbeats. The server sends `{"type": "ping"}` every 30 seconds.
+
+All pipeline messages are serialized `AgentEvent` objects with this envelope:
+
+```json
+{
+  "run_id": "uuid",
+  "stage": "triage",
+  "agent": "Alert Triager",
+  "status": "active",
+  "payload": {},
+  "error": null,
+  "created_at": "2026-06-16T00:00:00Z"
+}
+```
+
+Event types:
+
+| Status | Typical stage / agent | Payload shape |
+|---|---|---|
+| `queued` | `stage=triage`, `agent=orchestrator` | `alert`, `pipeline`, `agents`, `run_id`, `docker_available`, `docker_message` |
+| `active` | current stage agent or `Repro Sandbox` / `Validation Swarm` | `_stage_payload(...)` snapshot, or `{"timeout_seconds": ...}` for repro sandbox activation |
+| `handoff` | after a stage finishes | `mention`, `from_agent`, `to_agent`, `summary`, `payload` |
+| `complete` | stage finished successfully | the stage output model, with `repro_execution` included on repro completions |
+| `failed` | orchestrator, repro sandbox, or validation swarm | `errors` plus any available `fix`, `fix_export`, `tests`, `rca`, and an `error` string |
+| `done` | `stage=done`, `agent=orchestrator` | `rca`, `fix`, `validation`, `repo_full_name`, `branch`, `pr_url`, `pr_error`, `errors`, `fix_export` |
+
+The orchestrator also stores the event stream on disk when `RUNS_PERSIST=true`, using `RUNS_DIR/<run_id>.jsonl`.
+
+## Local Mocking & Testing Guide
+
+`LIVE_LLM_ENABLED=false` is the default in [backend/inference.py](backend/inference.py). In that mode, live JSON calls are blocked and the code falls back to deterministic local behavior.
+
+Good local testing patterns:
+
+- Use `FallbackOnlyAgent`-style stubs, as demonstrated in [tests/test_band_collaboration.py](tests/test_band_collaboration.py).
+- Monkeypatch `backend.agent_loop.run_repro_pass1` and `backend.agent_loop.run_validation_swarm` when you want orchestration coverage without a live Docker daemon.
+- Keep the repo-specific contract tests small and focused: the codebase already has coverage for alert normalization, validation finalization, Docker deployment checks, and websocket behavior.
+
+Useful commands:
+
+```bash
+pytest tests/test_band_collaboration.py -v
+pytest tests/test_orchestrator_validation.py -v
+pytest tests/test_orchestrator_finalize.py -v
+pytest tests/test_inference_guardrails.py -v
+pytest tests/test_main_api.py -v
+```
+
+For the full local suite:
+
+```bash
+pytest tests -v
+ruff check backend tests
+```
+
+## Known Issues & Potential Bugs
+
+- Docker is mandatory for the full orchestrator path. If the daemon is unavailable, repro and validation cannot complete.
+- The slim container images assume the repo can install or already has tools like `patch`, `pytest`, or `npm`-based build commands available through `setup_command`.
+- Validation only races two candidate patches. If both fail, time out, or cannot be applied, the run ends in `failed`.
+- The validation swarm is fail-fast by design, so concurrent container behavior can surface timing-dependent edge cases if one container is slow to report a winner.
+- The Repro stage system prompt currently mentions fields such as `expected_exit_code`, `files_involved`, and `environment_vars`, but the actual `ReproPlan` schema only contains `confirmed`, `assumptions`, `steps`, `expected_failure`, and `required_data`. That prompt/schema mismatch is a real maintenance risk.
+- LLM output must stay within JSON schema limits. Oversized prompts can trip `MAX_PROMPT_TOKENS`, and live calls are blocked entirely when `LIVE_LLM_ENABLED=false` or when spend/token guardrails are exhausted.
+- Repository resolution is constrained to `REPOS_ROOT` or the current project directory. Alerts that point elsewhere are rejected.
+- The Band runtime intentionally omits Docker validation and PR push, so its fixes should be treated as unvalidated suggestions until they pass through the orchestrator.
+- `run_validation_swarm(...)` and `run_repro_pass1(...)` depend on real Docker semantics, so mocks can diverge from production behavior if they do not emulate cleanup and patch application accurately.
+
+## Run Instructions
+
+### Windows
+
+```powershell
+.\scripts\start.ps1
+```
+
+That script starts the backend, waits for `/health`, and launches the frontend. If you want the headless demo path, run:
+
+```powershell
+.\scripts\start.ps1 -RunE2E
+```
+
+### Manual local run
+
+```bash
+pip install -e ".[dev]"
+uvicorn backend.main:app --host 127.0.0.1 --port 8000
+```
+
+In a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Then open `http://localhost:3000`.
+
+### Band runtime
+
+```bash
+python -m backend.band_runtime
+```
+
+### Useful checks
+
+```bash
+curl http://127.0.0.1:8000/health
+curl http://127.0.0.1:8000/metrics
+```
+
+## Current HTTP Endpoints
+
+- `GET /health` - backend and Docker readiness information.
+- `GET /metrics` - incident counters.
+- `GET /demo/alert` - built-in checkout demo payload.
+- `POST /incidents` - enqueue an incident run.
+- `WebSocket /ws/incidents` - stream pipeline events.
+- `GET /runs/{run_id}/fix.patch` - download the exported patch.
+- `GET /runs/{run_id}/report.html` - download the self-contained incident report.
+
+## Reference Files
+
+- [README.md](README.md) contains the broader project overview and quick-start notes.
+- [BAND_RUNTIME.md](BAND_RUNTIME.md) explains the difference between the orchestrator and Band runtime.
+- [backend/schemas.py](backend/schemas.py) is the authoritative source for the data models listed above.
+- [backend/agent_loop.py](backend/agent_loop.py) is the authoritative source for the orchestration and Docker behavior listed above.
