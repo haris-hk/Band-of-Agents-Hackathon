@@ -127,7 +127,7 @@ class IncidentAgent:
 
 @dataclass(frozen=True)
 class DockerSandboxConfig:
-    image: str = "python:3.11-slim"
+    image: str = "python:3.11"
     repo_path: Path = field(default_factory=lambda: Path.cwd())
     workdir: str = "/workspace"
     source_mount: str = "/workspace_src"
@@ -172,7 +172,7 @@ class DockerSandboxConfig:
             image=_alert_string(
                 alert,
                 ("docker_image", "container_image", "image"),
-                "python:3.11-slim",
+                "python:3.11",
             ),
             repo_path=repo_path.resolve(),
             workdir=_alert_string(alert, ("container_workdir", "workdir"), "/workspace"),
@@ -181,7 +181,7 @@ class DockerSandboxConfig:
             repro_command=_alert_string(
                 alert,
                 ("repro_command", "failing_command"),
-                _alert_string(alert, ("test_command",), "pytest"),
+                _alert_string(alert, ("test_command",), "pip install pytest && pytest"),
             ),
             validation_command=validation_command,
             patch_strip=max(0, _alert_int(alert, ("patch_strip",), 1)),
@@ -268,6 +268,7 @@ class DockerContainerExecutor:
             self._put_text_files("/tmp", {"candidate.patch": patch.patch_unified_diff})
 
             patch_command = (
+                "apt-get update -y && apt-get install -y patch || true; "
                 f"cd {shlex.quote(self.config.workdir)} && "
                 f"patch --batch --forward --fuzz=3 -p{self.config.patch_strip} "
                 "-i /tmp/candidate.patch"
@@ -276,6 +277,7 @@ class DockerContainerExecutor:
             if patch_code != 0:
                 # Retry without fuzz (in case LLM generated exact-context diffs)
                 patch_command2 = (
+                    "apt-get update -y && apt-get install -y patch || true; "
                     f"cd {shlex.quote(self.config.workdir)} && "
                     f"patch --batch --forward -p{self.config.patch_strip} "
                     "-i /tmp/candidate.patch"
@@ -609,6 +611,7 @@ def _docker_verify_patch(
             container.put_archive("/tmp", buf.read())
 
             patch_cmd = (
+                "apt-get update -y && apt-get install -y patch || true; "
                 "cd /workspace && "
                 "patch --batch --forward --fuzz=3 -p1 -i /tmp/candidate.patch"
             )
@@ -1474,27 +1477,31 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
             output_model=RegressionTests,
             system_prompt=(
-                "You are a senior test engineer writing a regression test to permanently prevent a production bug. "
-                "You receive the repo source files, Docker repro logs, and incident context. "
-                "Your ONLY output is a valid JSON object matching the RegressionTests schema — nothing else. "
-                "CRITICAL — detect the language/stack from the repo_files provided: "
-                "  - If package.json is present: this is a JavaScript/TypeScript/Node.js project. "
-                "    Write a Node.js test using the built-in 'node:assert' module, saved as a .mjs or .test.js file. "
-                "    The run_command must be: 'node <test_file>' (NOT pytest, NOT mocha unless it is already a dependency). "
-                "    The test must: read the actual source file paths shown in repo_files, "
-                "    use fs.readFileSync to check file contents match expected values, OR "
-                "    use dynamic import() to import the module and test it directly. "
-                "  - If setup.py / pyproject.toml / requirements.txt is present: Python project. Use pytest. "
-                "Rules: "
-                "1. test_files: use a real path like 'tests/test_regression.mjs' for JS or 'tests/test_regression.py' for Python. "
-                "   NEVER use 'services/checkout/handler.py' unless that exact file appears in repo_files. "
-                "   NEVER invent module paths — only import from paths that exist in the provided repo_files. "
-                "2. test_code: the test must FAIL on the current buggy code and PASS after the fix. "
-                "   For Node.js: use 'import assert from \"node:assert\";' and plain assert calls. "
-                "   For file-content changes: use fs.readFileSync and assert the new text is present. "
-                "3. run_command: the exact single shell command that runs the test (e.g. 'node tests/test_regression.mjs'). "
-                "4. framework: 'node' for JS/TS projects, 'pytest' for Python projects. "
-                "5. acceptance_criteria: 2-4 plain-English sentences on what a correct fix achieves."
+                "You are an expert Test Automation Architect. Your task is to write robust, self-discovering regression tests.\n"
+                "1. ANALYZE MODULES: Before writing tests, inspect the `repo_files` to determine the module structure. "
+                "   Use `PYTHONPATH=.` to ensure the root directory is importable.\n"
+                "2. DYNAMIC DISCOVERY: Do not hardcode tests for specific functions if the module exposes multiple entry points. "
+                "   If you need to verify variable states, explicitly import them from the target module.\n"
+                "3. STDOUT CAPTURE: To test print() output in Python, you MUST pass `capsys` as a parameter to the test function. "
+                "   CORRECT PATTERN:\n"
+                "   def test_func(capsys):\n"
+                "       func_to_test()\n"
+                "       captured = capsys.readouterr()\n"
+                "       assert 'expected' in captured.out\n"
+                "   NEVER use `pytest.capture` or `pytest.capture.capsys()`. These do not exist.\n"
+                "4. GENERIC IMPORTING: When importing, generate the import path based on the directory structure. "
+                "   If file is at `level_1_syntax/app.py`, import via `from level_1_syntax.app import ...`.\n"
+                "5. ROBUSTNESS: Ensure tests handle the `SyntaxError` case by checking if the module can be imported. "
+                "6. FINAL VALIDATION: Before outputting JSON, perform a mental check: "
+                "   a) Is `capsys` in the function parentheses? (Must be: def test_func(capsys):). "
+                "   b) Did I import every variable/function used? (e.g., 'from module import variable'). "
+                "   c) Is the module path correct relative to root? (PYTHONPATH=. makes the root the base)."
+                "7. run_command: the exact single shell command that runs the test (e.g. 'pip install pytest && PYTHONPATH=. pytest tests/test_regression.py')."
+                "8. CONTEXT-AWARE TESTING: ONLY write tests for files and functions that actually exist in the `repo_files` provided. "
+                "   - Do NOT assume a database exists. "
+                "   - Do NOT assume filesystem paths like '/app/uploads/' exist. "
+                "   - If a module (like level_4_security) is not in `repo_files`, do NOT import or test it. "
+                "   - Focus ONLY on testing the code that is actually present in the provided directory."
             ),
             fallback=_fallback_tests,
         ),
@@ -1533,6 +1540,9 @@ def build_agents() -> dict[Stage, IncidentAgent]:
                 "6. summary: one sentence describing what this candidate changes and why. "
                 "7. files_changed: list the EXACT relative file paths (matching repo_files keys). "
                 "8. rollback_plan: one sentence describing how to revert."
+                "9. CRITICAL: Fix the underlying logic minimally. Do not hide, wrap, or alter native runtime exceptions with new `try/except` blocks or custom error messages. Allow native language errors to bubble up naturally unless the original code explicitly catches them."
+                "10. TEST ALIGNMENT: You MUST read the provided regression test code carefully. Your patch MUST be written specifically to pass this test. If the test expects a specific exception, your code MUST raise that exact exception or leave the native behavior intact to ensure the test passes."
+                "11. COMPATIBILITY: Do not rename existing methods, classes, or variables unless absolutely necessary to fix the bug. Maintain the existing API contract so that existing tests do not break."
             ),
             fallback=_fallback_fix,
         ),

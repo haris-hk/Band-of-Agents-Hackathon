@@ -122,7 +122,7 @@ def _push_fix_as_pr_sync(state: IncidentState, repo_path: str) -> str:
 
     try:
         _run_cmd(
-            ["patch", "-p1", "--batch", "--forward", "--fuzz=0", "-i", patch_file],
+            ["git", "apply", "-p1", "--ignore-whitespace", patch_file],
             cwd=repo_path,
         )
     finally:
