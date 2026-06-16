@@ -479,24 +479,33 @@ async def run_repro_pass1(state: IncidentState, _plan: ReproPlan) -> ReproExecut
 
 def _make_unified_diff(file_path: str, original: str, new_content: str) -> str:
     """Generate a proper unified diff from original → new file content using difflib.
-    
-    Normalizes all line endings to Unix \\n to prevent Windows \\r\\n from
-    corrupting the diff when applied inside a Linux Docker container.
+
+    Normalizes all line endings to Unix \\n before diffing so the result is
+    safe to apply with `patch -p1` inside a Linux Docker container.
     """
     # Normalize to Unix line endings — critical for Linux patch command
     original_clean = original.replace("\r\n", "\n").replace("\r", "\n")
     new_clean = new_content.replace("\r\n", "\n").replace("\r", "\n")
+
+    # splitlines(keepends=True) keeps the \n on each line.
+    # Using lineterm="" on unified_diff would strip newlines from header lines
+    # (---, +++, @@) causing them to merge with the next line.
+    # Use the DEFAULT lineterm (adds \n to headers); content lines already have \n.
     original_lines = original_clean.splitlines(keepends=True)
     new_lines = new_clean.splitlines(keepends=True)
-    diff = difflib.unified_diff(
+
+    diff_parts = difflib.unified_diff(
         original_lines,
         new_lines,
         fromfile=f"a/{file_path}",
         tofile=f"b/{file_path}",
-        lineterm="",
+        # No lineterm arg — use default (\n appended to header-only lines)
     )
-    # Ensure the diff itself uses Unix line endings
-    return "\n".join("".join(diff).splitlines())
+    result = "".join(diff_parts)
+    # Final CRLF normalization (shouldn't be needed but be safe)
+    return result.replace("\r\n", "\n").replace("\r", "\n")
+
+
 
 
 
