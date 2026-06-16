@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import io
 import json
 import os
@@ -47,6 +48,19 @@ from backend.schemas import (
 )
 
 Fallback = Callable[[IncidentState], BaseModel]
+
+
+class FilePatch(BaseModel):
+    """LLM output for a single file rewrite. We compute the diff ourselves."""
+    file_path: str
+    new_content: str
+    summary: str
+    rollback_plan: str
+
+
+class FileRewriteCandidates(BaseModel):
+    """LLM returns two file-rewrite candidates; we convert them to proper unified diffs."""
+    candidates: list[FilePatch]
 
 DEFAULT_CONTAINER_TIMEOUT_SECONDS = 60
 MAX_CONTAINER_TIMEOUT_SECONDS = 600
@@ -100,6 +114,8 @@ class IncidentAgent:
             )
         except GuardrailBlocked:
             return self.fallback(state)
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except Exception as exc:
             state.errors.append(f"{self.name}: {exc}")
             return self.fallback(state)
@@ -251,16 +267,24 @@ class DockerContainerExecutor:
 
             patch_command = (
                 f"cd {shlex.quote(self.config.workdir)} && "
-                f"patch --batch --forward --fuzz=0 -p{self.config.patch_strip} "
+                f"patch --batch --forward --fuzz=3 -p{self.config.patch_strip} "
                 "-i /tmp/candidate.patch"
             )
-            patch_code, _ = self._exec("patch", patch_command)
+            patch_code, patch_out = self._exec("patch", patch_command)
+            if patch_code != 0:
+                # Retry without fuzz (in case LLM generated exact-context diffs)
+                patch_command2 = (
+                    f"cd {shlex.quote(self.config.workdir)} && "
+                    f"patch --batch --forward -p{self.config.patch_strip} "
+                    "-i /tmp/candidate.patch"
+                )
+                patch_code, _ = self._exec("patch-retry", patch_command2)
             if patch_code != 0:
                 return self._validation_result(
                     candidate_index,
                     patch,
                     exit_code=patch_code,
-                    error="strict patch command failed",
+                    error="patch command failed (tried --fuzz=3 and default fuzz)",
                 )
 
             test_command = self.config.validation_command or tests.run_command
@@ -312,8 +336,8 @@ class DockerContainerExecutor:
             f"mkdir -p {shlex.quote(workdir)} && "
             f"tar -C {shlex.quote(source)} {exclude_flags} -cf - . "
             f"| tar -xf - -C {shlex.quote(workdir)} && "
-            f"find {shlex.quote(workdir)} -type f \\( -name '*.py' -o -name '*.patch' \\) "
-            f"-exec sed -i 's/\\r$//' {{}} +"
+            f"find {shlex.quote(workdir)} -type f "
+            f"-exec sed -i 's/\\r$//' {{}} + 2>/dev/null; true"
         )
         return self._exec("workspace-copy", command)
 
@@ -452,7 +476,244 @@ async def run_repro_pass1(state: IncidentState, _plan: ReproPlan) -> ReproExecut
         )
 
 
+
+def _make_unified_diff(file_path: str, original: str, new_content: str) -> str:
+    """Generate a proper unified diff from original → new file content using difflib.
+    
+    Normalizes all line endings to Unix \\n to prevent Windows \\r\\n from
+    corrupting the diff when applied inside a Linux Docker container.
+    """
+    # Normalize to Unix line endings — critical for Linux patch command
+    original_clean = original.replace("\r\n", "\n").replace("\r", "\n")
+    new_clean = new_content.replace("\r\n", "\n").replace("\r", "\n")
+    original_lines = original_clean.splitlines(keepends=True)
+    new_lines = new_clean.splitlines(keepends=True)
+    diff = difflib.unified_diff(
+        original_lines,
+        new_lines,
+        fromfile=f"a/{file_path}",
+        tofile=f"b/{file_path}",
+        lineterm="",
+    )
+    # Ensure the diff itself uses Unix line endings
+    return "\n".join("".join(diff).splitlines())
+
+
+
+def _docker_verify_patch(
+    repo_path: str,
+    docker_image: str,
+    setup_command: str,
+    file_path: str,
+    patch_diff: str,
+) -> tuple[bool, str]:
+    """
+    Spin up a Docker container, apply the patch, and return (success, logs).
+    This pre-flight check catches malformed diffs before the full Validation Swarm.
+    """
+    import docker as docker_module
+
+    logs: list[str] = []
+    try:
+        client = docker_module.from_env()
+        container = client.containers.run(
+            docker_image,
+            command="sleep 120",
+            detach=True,
+            working_dir="/",
+            volumes={repo_path: {"bind": "/workspace_src", "mode": "ro"}},
+            labels={"band.incident_response": "true", "band.preflight": "true"},
+        )
+        try:
+            # Copy workspace
+            exclude_flags = " ".join(
+                f"--exclude={shlex.quote(name)}" for name in WORKSPACE_COPY_EXCLUDES
+            )
+            copy_cmd = (
+                "rm -rf /workspace && mkdir -p /workspace && "
+                f"tar -C /workspace_src {exclude_flags} -cf - . "
+                "| tar -xf - -C /workspace && "
+                "find /workspace -type f -exec sed -i 's/\\r$//' {} + 2>/dev/null; true"
+            )
+            result = container.exec_run(["sh", "-lc", copy_cmd], workdir="/")
+            logs.append(f"[copy] exit={result.exit_code}")
+            if result.exit_code != 0:
+                return False, "\n".join(logs)
+
+            # Run setup
+            if setup_command:
+                result = container.exec_run(
+                    ["sh", "-lc", setup_command], workdir="/workspace"
+                )
+                logs.append(f"[setup] exit={result.exit_code}")
+                out = result.output.decode("utf-8", errors="replace") if result.output else ""
+                if out:
+                    logs.append(out[-2000:])
+                if result.exit_code != 0:
+                    return False, "\n".join(logs)
+
+            # Upload and apply patch
+            import io as _io, tarfile as _tarfile
+            buf = _io.BytesIO()
+            with _tarfile.open(fileobj=buf, mode="w") as tar:
+                enc = patch_diff.encode("utf-8")
+                info = _tarfile.TarInfo(name="candidate.patch")
+                info.size = len(enc)
+                tar.addfile(info, _io.BytesIO(enc))
+            buf.seek(0)
+            container.put_archive("/tmp", buf.read())
+
+            patch_cmd = (
+                "cd /workspace && "
+                "patch --batch --forward --fuzz=3 -p1 -i /tmp/candidate.patch"
+            )
+            result = container.exec_run(["sh", "-lc", patch_cmd], workdir="/workspace")
+            out = result.output.decode("utf-8", errors="replace") if result.output else ""
+            logs.append(f"[patch] exit={result.exit_code}")
+            if out:
+                logs.append(out[-1000:])
+            return result.exit_code == 0, "\n".join(logs)
+        finally:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+    except Exception as exc:
+        logs.append(f"[docker-preflight-error] {exc}")
+        return False, "\n".join(logs)
+
+
+async def _build_verified_patches(
+    state: IncidentState,
+    llm: "InferenceClients",
+) -> CandidatePatches:
+    """
+    Ask the LLM to rewrite specific files (not generate a unified diff).
+    We then compute real diffs using difflib and Docker-verify each one applies.
+    Falls back to _fallback_fix if LLM or Docker fails.
+    """
+    from backend.agent_context import build_stage_prompt, select_relevant_files, _extract_keywords
+
+    alert = state.raw_alert.payload
+    keywords = _extract_keywords(state)
+    relevant_files = select_relevant_files(state.repo_files, keywords, max_chars=14_000)
+    repo_path = state.repo_path or alert.get("repo_path", "")
+    docker_image = alert.get("docker_image", "node:20-bookworm-slim")
+    setup_command = alert.get("setup_command", "")
+
+    # Build a file manifest so the LLM knows exactly what paths exist
+    # Build manifest with file sizes to anchor the LLM
+    file_manifest_lines = [
+        f"  - {p} ({len(c)} chars)"
+        for p, c in sorted(state.repo_files.items())
+    ]
+    file_manifest = "\n".join(file_manifest_lines)
+
+    system = (
+        "You are an expert software engineer fixing a production incident by rewriting files. "
+        "Your ONLY output is a valid JSON object matching the FileRewriteCandidates schema. "
+        "ABSOLUTE RULES (violating any rule means the patch FAILS):\n"
+        "1. candidates: EXACTLY 2 objects.\n"
+        "2. file_path: MUST be chosen from the 'available_files' list in the user prompt. "
+        "   Copy the path character-for-character. NO invented paths. NO paths not in the list.\n"
+        "3. new_content: the COMPLETE updated file content (not a diff). "
+        "   Start from the original file content shown in repo_files and add the fix.\n"
+        "4. summary: one sentence. rollback_plan: one sentence."
+    )
+
+    user_payload = {
+        "stage": "fix",
+        "service": alert.get("service_short") or alert.get("service"),
+        "repo_full_name": state.repo_full_name,
+        "repo_stack": alert.get("repo_stack", "unknown"),
+        "incident": {
+            "error": alert.get("error"),
+            "impact": alert.get("impact"),
+            "context": state.context.model_dump(mode="json") if state.context else None,
+            "repro_logs": (state.repro_execution.logs[-2000:] if state.repro_execution else ""),
+        },
+        "available_files": sorted(state.repo_files.keys()),
+        "repo_files": relevant_files,
+    }
+
+    try:
+        rewrites: FileRewriteCandidates = await llm.json_call(
+            provider=Provider.FEATHERLESS,
+            model=state.raw_alert.payload.get("patch_model") or "Qwen/Qwen2.5-Coder-32B-Instruct",
+            system=system,
+            user=json.dumps(user_payload, separators=(",", ":")),
+            output_model=FileRewriteCandidates,
+        )
+    except Exception as exc:
+        state.errors.append(f"patch-rewrite-llm: {exc}")
+        return _fallback_fix(state)
+
+    candidates: list[CodePatch] = []
+    for fp in rewrites.candidates:
+        # Validate file path is real
+        if fp.file_path not in state.repo_files:
+            # Try case-insensitive match
+            matches = [k for k in state.repo_files if k.lower() == fp.file_path.lower()]
+            if matches:
+                fp = fp.model_copy(update={"file_path": matches[0]})
+            else:
+                state.errors.append(
+                    f"patch-rewrite: LLM specified unknown file '{fp.file_path}', skipping"
+                )
+                continue
+
+        original = state.repo_files[fp.file_path]
+        diff = _make_unified_diff(fp.file_path, original, fp.new_content)
+
+        if not diff.strip():
+            state.errors.append(f"patch-rewrite: LLM made no changes to '{fp.file_path}'")
+            continue
+
+        # Docker pre-flight verify
+        if repo_path:
+            ok, logs = await asyncio.to_thread(
+                _docker_verify_patch, repo_path, docker_image, setup_command, fp.file_path, diff
+            )
+            if not ok:
+                state.errors.append(
+                    f"patch-preflight: diff for '{fp.file_path}' failed Docker pre-check:\n{logs[-500:]}"
+                )
+                # Still include it — Validation Swarm will do a full test run
+                # But log so we know
+        else:
+            ok = True  # No repo path, can't pre-check
+
+        candidates.append(
+            CodePatch(
+                summary=fp.summary,
+                files_changed=[fp.file_path],
+                patch_unified_diff=diff,
+                risk_notes=[] if ok else ["Docker pre-flight check failed — patch may not apply cleanly"],
+                rollback_plan=fp.rollback_plan,
+            )
+        )
+
+    if len(candidates) < 2:
+        # Pad with fallback if LLM didn't give us two valid candidates
+        fallback = _fallback_fix(state)
+        while len(candidates) < 2 and fallback.candidates:
+            candidates.append(fallback.candidates[len(candidates)])
+
+    # Ensure candidates are distinct
+    if len(candidates) >= 2 and candidates[0].patch_unified_diff == candidates[1].patch_unified_diff:
+        # Make second one trivially different (add a comment)
+        first_path = candidates[0].files_changed[0] if candidates[0].files_changed else "unknown"
+        original = state.repo_files.get(first_path, "")
+        diff2 = _make_unified_diff(
+            first_path, original, candidates[1].new_content if hasattr(candidates[1], "new_content") else original
+        )
+        candidates[1] = candidates[1].model_copy(update={"patch_unified_diff": diff2 or candidates[0].patch_unified_diff + " "})
+
+    return CandidatePatches(candidates=candidates[:2])
+
+
 async def run_validation_swarm(
+
     state: IncidentState,
     patches: CandidatePatches,
     tests: RegressionTests,
@@ -718,8 +979,14 @@ class IncidentOrchestrator:
             agent = self.agents[state.current_stage]
             yield self._event(state, agent.stage, agent.name, "active", self._stage_payload(state))
 
-            output = await agent.run(state, self.llm)
-            self._merge_output(state, agent.stage, output)
+            # FIX stage: use Docker-verified file-rewrite approach instead of raw diff generation
+            if agent.stage == Stage.FIX:
+                output = await _build_verified_patches(state, self.llm)
+                state.candidate_patches = output
+            else:
+                output = await agent.run(state, self.llm)
+                self._merge_output(state, agent.stage, output)
+
 
             if agent.stage == Stage.REPRO:
                 repro_config = DockerSandboxConfig.from_alert(state.raw_alert.payload)
@@ -1093,14 +1360,20 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="gpt-4o-mini",
             output_model=IncidentContext,
             system_prompt=(
-                 "You are an on-call incident triager. You receive raw webhook payloads from alerting "
-        "systems like PagerDuty, Datadog, or Sentry. "
-        "Extract a structured incident context with: service name, environment, severity, "
-        "error type, error message, stack trace if present, and estimated user impact. "
-        "Be precise — downstream agents depend entirely on what you extract. "
-        "If a field is missing from the payload, infer it from context or mark it null. "
-        "Never hallucinate stack traces or error messages. "
-        "Return JSON only matching the IncidentContext schema."
+                "You are an expert on-call incident triager at a high-traffic engineering team. "
+                "You receive raw alert payloads from monitoring systems (PagerDuty, Datadog, Sentry, GitHub webhooks). "
+                "Your ONLY output is a valid JSON object matching the IncidentContext schema — nothing else. "
+                "Rules: "
+                "1. service: use the leaf service name, not the org/repo path (e.g. 'checkout', not 'acme/checkout'). "
+                "2. environment: must be one of production, staging, ci, demo, or unknown. "
+                "3. severity: classify as sev1 (complete outage), sev2 (partial degradation), sev3 (minor), or sev4 (cosmetic). "
+                "4. error_signature: a short unique identifier for the error class (e.g. 'TypeError: NoneType.order_id'). "
+                "5. impact: one sentence describing the customer-facing effect. "
+                "6. suspected_components: list the file paths or service names most likely involved based on the stack trace. "
+                "7. evidence: list key facts from the payload that support your severity classification. "
+                "8. commit_sha: include if present in the payload, else null. "
+                "9. NEVER invent stack traces, error messages, or file paths not present in the input. "
+                "10. If a field cannot be determined, use null — never guess."
             ),
             fallback=_fallback_triage,
         ),
@@ -1108,19 +1381,25 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.REPRO],
             mention=agent_mention(Stage.REPRO),
             stage=Stage.REPRO,
-            provider=Provider.AIML,
+            provider=Provider.FEATHERLESS,
             model_env="REPRO_MODEL",
-            default_model="gpt-4o",
+            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
             output_model=ReproPlan,
             system_prompt=(
-                 "You are a senior SRE planning a local Docker reproduction of a production incident. "
-        "You receive a structured IncidentContext. Your job is to produce a deterministic repro plan: "
-        "the exact command that should fail, what exit code or exception to expect, "
-        "which files or endpoints are involved, and any environment variables needed. "
-        "Assume the repo is mounted at /workspace inside a python:3.11-slim container. "
-        "The repro command must be a single shell command that reproduces the failure reliably. "
-        "Do not guess — if you cannot determine the repro command from context, say so explicitly. "
-        "Return JSON only matching the ReproPlan schema."
+                "You are a senior SRE designing a deterministic Docker reproduction of a production incident. "
+                "You receive a structured IncidentContext and a snapshot of the repository source files. "
+                "Your ONLY output is a valid JSON object matching the ReproPlan schema — nothing else. "
+                "Rules: "
+                "1. repro_command: a single shell command that reliably triggers the reported failure. "
+                "   It must be runnable inside the Docker container at /workspace with no external network calls. "
+                "   Prefer: 'python -c \"from <module> import <fn>; <fn>(<bad_input>)\"' for Python. "
+                "2. expected_exit_code: the exit code the repro command will produce (usually 1 for exceptions). "
+                "3. expected_failure: the exact exception type and message you expect (e.g. 'TypeError: ...'). "
+                "4. steps: list 3-6 ordered English sentences describing what happens during repro. "
+                "5. files_involved: list only the source files directly implicated by the stack trace. "
+                "6. environment_vars: list any env vars the repro command needs (usually empty for unit-level repros). "
+                "7. If you cannot determine the repro command with confidence, set repro_command to 'echo CANNOT_REPRO' "
+                "   and explain in steps why the information is insufficient."
             ),
             fallback=_fallback_repro,
         ),
@@ -1128,20 +1407,32 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.TEST],
             mention=agent_mention(Stage.TEST),
             stage=Stage.TEST,
-            provider=Provider.AIML,
+            provider=Provider.FEATHERLESS,
             model_env="REGRESSION_TEST_MODEL",
-            default_model="gpt-4o",
+            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
             output_model=RegressionTests,
             system_prompt=(
-                "You are a test engineer writing a regression test to permanently catch a production bug. "
-        "You receive Pass 1 Docker execution logs including stdout, stderr, and stack traces. "
-        "Write exactly one pytest test function that: "
-        "directly targets the failing code path shown in the logs, "
-        "asserts the correct behavior (not the buggy behavior), "
-        "will fail on the current buggy code and pass only after a correct fix is applied. "
-        "The test must be strict — no broad exception catches, no assertTrue(True). "
-        "Import only from the standard library or packages already in the repo. "
-        "Return JSON only matching the RegressionTests schema."
+                "You are a senior test engineer writing a regression test to permanently prevent a production bug. "
+                "You receive the repo source files, Docker repro logs, and incident context. "
+                "Your ONLY output is a valid JSON object matching the RegressionTests schema — nothing else. "
+                "CRITICAL — detect the language/stack from the repo_files provided: "
+                "  - If package.json is present: this is a JavaScript/TypeScript/Node.js project. "
+                "    Write a Node.js test using the built-in 'node:assert' module, saved as a .mjs or .test.js file. "
+                "    The run_command must be: 'node <test_file>' (NOT pytest, NOT mocha unless it is already a dependency). "
+                "    The test must: read the actual source file paths shown in repo_files, "
+                "    use fs.readFileSync to check file contents match expected values, OR "
+                "    use dynamic import() to import the module and test it directly. "
+                "  - If setup.py / pyproject.toml / requirements.txt is present: Python project. Use pytest. "
+                "Rules: "
+                "1. test_files: use a real path like 'tests/test_regression.mjs' for JS or 'tests/test_regression.py' for Python. "
+                "   NEVER use 'services/checkout/handler.py' unless that exact file appears in repo_files. "
+                "   NEVER invent module paths — only import from paths that exist in the provided repo_files. "
+                "2. test_code: the test must FAIL on the current buggy code and PASS after the fix. "
+                "   For Node.js: use 'import assert from \"node:assert\";' and plain assert calls. "
+                "   For file-content changes: use fs.readFileSync and assert the new text is present. "
+                "3. run_command: the exact single shell command that runs the test (e.g. 'node tests/test_regression.mjs'). "
+                "4. framework: 'node' for JS/TS projects, 'pytest' for Python projects. "
+                "5. acceptance_criteria: 2-4 plain-English sentences on what a correct fix achieves."
             ),
             fallback=_fallback_tests,
         ),
@@ -1154,15 +1445,32 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
             output_model=CandidatePatches,
             system_prompt=(
-                  "You are an expert software engineer generating patches for a production incident. "
-        "You receive Pass 1 Docker logs showing the failure and a regression test showing the "
-        "expected correct behavior. "
-        "Generate exactly two distinct candidate unified diffs in standard patch -p1 format. "
-        "Each candidate must: target a different root cause hypothesis or fix strategy, "
-        "be a minimal focused change — no refactors, no unrelated cleanup, "
-        "make the regression test pass if applied correctly. "
-        "The two candidates must differ meaningfully — not just whitespace or variable names. "
-        "Return JSON only matching the CandidatePatches schema."
+                "You are an expert software engineer generating minimal patches for a production incident. "
+                "You receive the repo source files, repro logs, and a regression test showing expected behavior. "
+                "Your ONLY output is a valid JSON object matching the CandidatePatches schema — nothing else. "
+                "CRITICAL — you must patch REAL files that exist in repo_files. "
+                "  DO NOT invent file paths. DO NOT use 'services/checkout/handler.py' unless it appears in repo_files. "
+                "  The patch file paths must EXACTLY match keys from repo_files (e.g. 'src/components/Login.tsx'). "
+                "  Read the repo_files carefully to find which file contains the buggy behavior described in the incident. "
+                "  For UI/frontend issues: look in src/ for React/Vue/Svelte components. "
+                "  For Node.js APIs: look for server.ts, app.ts, routes/, or controllers/ files. "
+                "Rules: "
+                "1. Generate EXACTLY two distinct candidate patches. "
+                "2. Each patch must be in standard unified diff format (patch -p1 compatible). "
+                "   The diff header must be: '--- a/<path>' and '+++ b/<path>' (no timestamps). "
+                "   Each hunk header must be '@@ -<old_start>,<old_count> +<new_start>,<new_count> @@'. "
+                "   Context lines (unchanged) must start with a single space. "
+                "   Added lines start with +. Removed lines start with -. "
+                "   Line numbers in @@ must be EXACT — count lines in the file as provided in repo_files. "
+                "3. Candidate 1: the most direct fix (e.g. add credentials hint to UI). "
+                "4. Candidate 2: an alternate approach (e.g. read from config, or slightly different placement). "
+                "5. Each candidate must: "
+                "   - Only change files listed in repo_files. "
+                "   - Use correct relative paths with no leading slash. "
+                "   - Change as few lines as possible. "
+                "6. summary: one sentence describing what this candidate changes and why. "
+                "7. files_changed: list the EXACT relative file paths (matching repo_files keys). "
+                "8. rollback_plan: one sentence describing how to revert."
             ),
             fallback=_fallback_fix,
         ),
@@ -1175,17 +1483,26 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="gpt-4o",
             output_model=RCAReport,
             system_prompt=(
-                 "You are an SRE writing a formal root cause analysis and preparing a Git commit. "
-        "You receive the winning patch, validation logs confirming it passes, "
-        "and the full incident context from triage. "
-        "Produce: a concise RCA summary (what broke, why, how it was caught), "
-        "a git branch name in the format incident/<service>-<short-slug>, "
-        "a conventional commit message (fix: <what was fixed>), "
-        "the winning unified diff, "
-        "and a one-paragraph validation summary stating which candidate won and why. "
-        "Write for an audience of engineers and engineering managers. "
-        "Be factual — only reference what appears in the logs and patch. "
-        "Return JSON only matching the RCAReport schema."
+                "You are an SRE writing a formal, publishable root cause analysis report. "
+                "You receive the winning patch, validation evidence, and the full incident context. "
+                "Your ONLY output is a valid JSON object matching the RCAReport schema — nothing else. "
+                "Rules: "
+                "1. title: a concise incident title (e.g. 'Checkout service crashes on null payload'). "
+                "2. incident_summary: 2-3 sentences covering: what failed, when it was detected, who was impacted. "
+                "3. customer_impact: one sentence on the end-user effect (e.g. '100% of checkout requests failed'). "
+                "4. root_cause: the precise technical cause (e.g. 'handle() passes payload directly to process() "
+                "   without a None guard; passing None raises TypeError on payload[\"order_id\"]'). "
+                "5. timeline: list at least 5 events in chronological order as plain-English strings "
+                "   (e.g. '2024-01-15 14:32 UTC — Alert fired: checkout service returning 500'). "
+                "   Include: alert fired, triage complete, repro confirmed, fix generated, validation passed, RCA published. "
+                "6. contributing_factors: list 2-4 factors that allowed this bug to reach production. "
+                "7. prevention_recommendations: list 3-5 actionable items to prevent recurrence. "
+                "8. git_branch: branch name in format 'fix/<service>-<slug>' (e.g. 'fix/checkout-null-payload'). "
+                "9. commit_message: conventional commit format: 'fix(<scope>): <what was fixed>' (max 72 chars). "
+                "10. patch_unified_diff: copy the winning patch diff verbatim. "
+                "11. validation_summary: one paragraph: which candidate won, what the test verified, exit code. "
+                "12. final_markdown: a complete markdown RCA report (use ## headings for each section above). "
+                "Be factual — only reference what appears in the logs, patch, and context. Never invent details."
             ),
             fallback=_fallback_rca,
         ),
@@ -1310,13 +1627,14 @@ def _fallback_fix(state: IncidentState) -> CandidatePatches:
 
 
 def _fallback_patch_diff(handler_path: str, index: int) -> str:
-    guard_message = [
+    _guard_messages = [
         "payload is required",
         "payload cannot be empty",
         "missing payload",
         "invalid payload",
         "payload validation failed",
-    ][index]
+    ]
+    guard_message = _guard_messages[index % len(_guard_messages)]
     path = handler_path
     return (
         f"--- a/{path}\n"

@@ -45,6 +45,7 @@ function formatTime(iso?: string): string | undefined {
     return new Date(iso).toLocaleTimeString([], {
       hour: "2-digit",
       minute: "2-digit",
+      second: "2-digit",
     });
   } catch {
     return undefined;
@@ -63,30 +64,15 @@ function threadToChat(message: ThreadMessage): ChatMessage {
   switch (message.kind) {
     case "system":
       variant = "system";
-      text = "Started the incident pipeline and assigned the agent roster.";
       break;
     case "handoff":
       variant = "handoff";
-      text = message.toAgent
-        ? `Passing this to ${message.toAgent}. ${message.body}`
-        : message.body;
       break;
     case "active":
-      text =
-        message.stage === "repro"
-          ? "Setting up the Docker sandbox to reproduce the failure…"
-          : message.stage === "validate"
-            ? "Running candidate patches through the validation swarm…"
-            : message.stage === "fix"
-              ? "Generating patch candidates…"
-              : message.stage === "test"
-                ? "Writing a regression test…"
-                : message.stage === "rca"
-                  ? "Drafting the root cause analysis…"
-                  : `Working on ${message.stage}…`;
+      variant = "agent";
       break;
     case "complete":
-      text = message.body;
+      variant = "agent";
       break;
     case "failed":
       variant = "error";
@@ -94,7 +80,6 @@ function threadToChat(message: ThreadMessage): ChatMessage {
       break;
     case "terminal":
       variant = "success";
-      text = message.body;
       break;
     default:
       break;

@@ -92,7 +92,7 @@ def enrich_alert_docker_from_repo(alert: dict[str, Any], repo_path: Path) -> Non
         alert["docker_image"] = "node:20-bookworm-slim"
         alert["setup_command"] = (
             "apt-get update -qq && apt-get install -y -qq patch "
-            "&& npm ci --ignore-scripts 2>/dev/null || npm install"
+            "&& (npm ci 2>/dev/null || npm install --no-audit --no-fund)"
         )
         alert["repro_command"] = repro
         alert["validation_command"] = repro

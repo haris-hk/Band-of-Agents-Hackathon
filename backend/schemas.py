@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 try:
     from enum import StrEnum
 except ImportError:  # pragma: no cover - compatibility for local Python 3.9 runners.
@@ -12,6 +12,11 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, model_validator
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC timestamp (replaces deprecated datetime.utcnow)."""
+    return datetime.now(timezone.utc)
 
 
 class Stage(StrEnum):
@@ -40,7 +45,7 @@ class Provider(StrEnum):
 class RawAlert(BaseModel):
     source: str = "simulated-webhook"
     payload: dict[str, Any]
-    received_at: datetime = Field(default_factory=datetime.utcnow)
+    received_at: datetime = Field(default_factory=_utcnow)
 
 
 class IncidentContext(BaseModel):
@@ -93,7 +98,7 @@ class CandidatePatches(BaseModel):
 
 class RegressionTests(BaseModel):
     framework: str = "pytest"
-    test_files: list[str] = Field(default_factory=list, max_length=1)
+    test_files: list[str] = Field(default_factory=list)
     test_code: str
     run_command: str = "pytest"
     acceptance_criteria: list[str] = Field(default_factory=list)
@@ -138,7 +143,7 @@ class AgentHandoff(BaseModel):
     payload: dict[str, Any]
     message_type: str = "band.handoff.v1"
     summary: str | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class AgentEvent(BaseModel):
@@ -148,7 +153,7 @@ class AgentEvent(BaseModel):
     status: Literal["queued", "active", "handoff", "complete", "failed", "done"]
     payload: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class IncidentState(BaseModel):

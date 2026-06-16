@@ -8,7 +8,7 @@ from typing import Any
 
 from backend.git_output import resolve_github_token
 
-_CODE_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rs", ".rb")
+_CODE_EXTENSIONS = (".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".java", ".rs", ".rb", ".md", ".json", ".yml", ".yaml", ".html", ".css")
 _SKIP_DIRS = {
     ".git",
     ".venv",
@@ -58,12 +58,14 @@ def _is_relative_to(path: Path, root: Path) -> bool:
 def load_repo_files(
     repo_path: str | Path,
     *,
-    max_files: int = 25,
+    max_files: int = 40,
     max_bytes_per_file: int = 12_000,
+    max_total_bytes: int = 100_000,
 ) -> dict[str, str]:
     """Load a bounded slice of repository source for LLM context."""
     root = Path(repo_path).resolve()
     code_map: dict[str, str] = {}
+    total_bytes = 0
 
     for dirpath, dirnames, filenames in os.walk(root):
         dirnames[:] = [name for name in dirnames if name not in _SKIP_DIRS]
@@ -79,12 +81,24 @@ def load_repo_files(
                 raw = full_path.read_bytes()
             except OSError:
                 continue
+            
+            # If the file itself exceeds max_bytes_per_file, truncate it
             if len(raw) > max_bytes_per_file:
-                text = raw[:max_bytes_per_file].decode("utf-8", errors="replace")
-                text += "\n... [truncated]"
+                chunk = raw[:max_bytes_per_file]
+                text = chunk.decode("utf-8", errors="replace") + "\n... [truncated]"
+                added_bytes = len(chunk)
             else:
                 text = raw.decode("utf-8", errors="replace")
+                added_bytes = len(raw)
+            
+            # Check if this file pushes us over the total bytes limit
+            if total_bytes + added_bytes > max_total_bytes:
+                # We could truncate the file further, but skipping it is safer to ensure valid file boundaries
+                continue
+
             code_map[rel] = text
+            total_bytes += added_bytes
+            
             if len(code_map) >= max_files:
                 return code_map
 

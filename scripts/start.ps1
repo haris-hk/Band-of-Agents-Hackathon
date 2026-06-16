@@ -59,7 +59,7 @@ if (-not (Test-Path "$Root\frontend\node_modules")) {
 }
 
 Write-Host "Starting frontend on http://localhost:3000 ..."
-$frontend = Start-Process -FilePath "npm" -ArgumentList "run", "dev" `
+$frontend = Start-Process -FilePath "cmd" -ArgumentList "/c", "npm", "run", "dev" `
     -WorkingDirectory "$Root\frontend" -PassThru
 
 Write-Host ""

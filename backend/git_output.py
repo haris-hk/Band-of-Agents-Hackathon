@@ -47,7 +47,11 @@ def _resolve_token(repo_full_name: str) -> str:
     private_key = os.environ.get("GITHUB_APP_PRIVATE_KEY")
 
     if app_id and private_key:
-        pem = open(private_key).read() if os.path.isfile(private_key) else private_key
+        from pathlib import Path as _Path
+        try:
+            pem = _Path(private_key).read_text(encoding="utf-8") if os.path.isfile(private_key) else private_key
+        except OSError as exc:
+            raise ValueError(f"Could not read GITHUB_APP_PRIVATE_KEY file: {exc}") from exc
         auth = Auth.AppAuth(int(app_id), pem)
         gi = GithubIntegration(auth=auth)
         override_install_id = os.environ.get("GITHUB_APP_INSTALLATION_ID")
@@ -109,9 +113,12 @@ def _push_fix_as_pr_sync(state: IncidentState, repo_path: str) -> str:
     except RuntimeError:
         _run_cmd(["git", "checkout", branch_name], cwd=repo_path)
 
-    with tempfile.NamedTemporaryFile(mode="w", suffix=".patch", delete=False) as handle:
+    with tempfile.NamedTemporaryFile(
+        mode="w", suffix=".patch", delete=False, encoding="utf-8"
+    ) as handle:
         handle.write(patch_diff)
         patch_file = handle.name
+    # File must be closed before _run_cmd opens it (required on Windows).
 
     try:
         _run_cmd(
@@ -119,7 +126,10 @@ def _push_fix_as_pr_sync(state: IncidentState, repo_path: str) -> str:
             cwd=repo_path,
         )
     finally:
-        os.unlink(patch_file)
+        try:
+            os.unlink(patch_file)
+        except OSError:
+            pass
 
     _run_cmd(["git", "add", "-A"], cwd=repo_path)
     _run_cmd(["git", "commit", "-m", commit_message], cwd=repo_path)

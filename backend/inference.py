@@ -64,9 +64,11 @@ class SpendGuard:
         if estimated_tokens <= 0:
             raise GuardrailBlocked("LLM call blocked: token estimate must be positive")
         if self.max_run_tokens <= 0 or self.used_tokens + estimated_tokens > self.max_run_tokens:
+            print(f"DEBUG: used_tokens ({self.used_tokens}) + estimated ({estimated_tokens}) > max_run_tokens ({self.max_run_tokens})")
             raise GuardrailBlocked("LLM call blocked by MAX_RUN_TOKENS guardrail")
         estimated_usd = (estimated_tokens / 1000) * price_per_1k
         if self.max_usd <= 0 or self.spent_usd + estimated_usd > self.max_usd:
+            print(f"DEBUG: spent_usd ({self.spent_usd}) + estimated_usd ({estimated_usd}) > max_usd ({self.max_usd})")
             raise GuardrailBlocked("LLM call blocked by MAX_RUN_USD guardrail")
         self.spent_usd += estimated_usd
         self.used_tokens += estimated_tokens
@@ -129,7 +131,8 @@ class InferenceClients:
         schema_json = json.dumps(schema_hint, separators=(",", ":"))
         prompt_tokens = estimate_tokens(system) + estimate_tokens(user) + estimate_tokens(schema_json)
         if prompt_tokens > self.settings.max_prompt_tokens:
-            raise GuardrailBlocked("LLM call blocked by MAX_PROMPT_TOKENS guardrail")
+            print(f"DEBUG: prompt_tokens ({prompt_tokens}) > max_prompt_tokens ({self.settings.max_prompt_tokens})")
+            raise GuardrailBlocked(f"LLM call blocked by MAX_PROMPT_TOKENS guardrail (prompt_tokens={prompt_tokens})")
         reserved_tokens = self.guard.reserve(prompt_tokens + self.settings.max_agent_tokens, price)
         messages = [
             {"role": "system", "content": system},
@@ -143,13 +146,18 @@ class InferenceClients:
         ]
 
         async with asyncio.timeout(self.settings.request_timeout_seconds):
-            response = await client.chat.completions.create(
-                model=model,
-                messages=messages,
-                max_tokens=self.settings.max_agent_tokens,
-                temperature=0,
-                response_format={"type": "json_object"},
-            )
+            try:
+                response = await client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    max_tokens=self.settings.max_agent_tokens,
+                    temperature=0,
+                    response_format={"type": "json_object"},
+                )
+            except asyncio.TimeoutError:
+                raise GuardrailBlocked(
+                    f"LLM call timed out after {self.settings.request_timeout_seconds}s"
+                )
 
         usage = getattr(response, "usage", None)
         actual_tokens = getattr(usage, "total_tokens", None) if usage is not None else None
@@ -158,4 +166,8 @@ class InferenceClients:
         try:
             return output_model.model_validate_json(content)
         except ValidationError:
+            pass
+        try:
             return output_model.model_validate(json.loads(content))
+        except (ValidationError, json.JSONDecodeError) as exc:
+            raise GuardrailBlocked(f"LLM response could not be parsed: {exc}") from exc

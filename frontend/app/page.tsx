@@ -481,7 +481,7 @@ export default function IncidentDashboard() {
           </nav>
 
           <div className="tabPanel">
-            {activeTab === "chat" && <AgentChat messages={chatMessages} />}
+            {activeTab === "chat" && <AgentChat messages={chatMessages} isRunning={running} />}
             {activeTab === "report" && (
               <ReportTab
                 rca={final.rca}
@@ -493,6 +493,8 @@ export default function IncidentDashboard() {
                 failureMessage={final.failureMessage}
                 errors={final.errors}
                 fixExport={final.fixExport}
+                runId={runId}
+                apiBase={API_BASE}
               />
             )}
             {activeTab === "changes" && (
@@ -504,6 +506,11 @@ export default function IncidentDashboard() {
                 filesFromExport={final.fixExport?.files_changed ?? []}
                 runId={runId}
                 apiBase={API_BASE}
+                prUrl={final.prUrl}
+                prError={final.prError}
+                branch={final.branch}
+                repoName={final.repoName}
+                fixExport={final.fixExport}
               />
             )}
             {activeTab === "input" && (
