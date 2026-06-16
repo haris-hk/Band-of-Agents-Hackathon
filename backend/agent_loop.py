@@ -137,6 +137,7 @@ class DockerSandboxConfig:
     patch_strip: int = 1
     timeout_seconds: int = DEFAULT_CONTAINER_TIMEOUT_SECONDS
     network_disabled: bool = False
+    build_command: str | None = None  # Explicit build command; None = auto-detect
 
     @classmethod
     def from_alert(
@@ -190,6 +191,7 @@ class DockerSandboxConfig:
                 ("docker_network_disabled", "network_disabled"),
                 False,
             ),
+            build_command=_alert_optional_string(alert, ("build_command",)),
         )
 
 
@@ -287,6 +289,20 @@ class DockerContainerExecutor:
                     error="patch command failed (tried --fuzz=3 and default fuzz)",
                 )
 
+            # --- Docker Build Pass ---
+            # Detect the build command from the alert or repo stack, then run it.
+            # This ensures the patched code actually compiles before claiming success.
+            build_command = self.config.build_command or self._infer_build_command()
+            if build_command:
+                build_code, build_out = self._exec("build", build_command, workdir=self.config.workdir)
+                if build_code != 0:
+                    return self._validation_result(
+                        candidate_index,
+                        patch,
+                        exit_code=build_code,
+                        error=f"Docker build pass failed (fix introduces compile/syntax errors): {build_out[-500:]}",
+                    )
+
             test_command = self.config.validation_command or tests.run_command
             exit_code, _ = self._exec("validation", test_command, workdir=self.config.workdir)
             return self._validation_result(candidate_index, patch, exit_code=exit_code)
@@ -358,6 +374,23 @@ class DockerContainerExecutor:
         exit_code = int(result.exit_code if result.exit_code is not None else -1)
         self._log_chunks.append(f"[exit_code={exit_code}] {label}")
         return exit_code, output
+
+    def _infer_build_command(self) -> str | None:
+        """Auto-detect the build/compile-check command based on repo structure."""
+        workdir = shlex.quote(self.config.workdir)
+        # Node.js with TypeScript — fastest compile check
+        code, _ = self._exec("build-detect-ts", f"test -f {workdir}/tsconfig.json")
+        if code == 0:
+            return f"cd {workdir} && npx --yes tsc --noEmit 2>&1 | tail -30"
+        # Node.js without TypeScript — just validate package.json exists
+        code, _ = self._exec("build-detect-node", f"test -f {workdir}/package.json")
+        if code == 0:
+            return None  # No compile step for plain JS; skip build pass
+        # Python project
+        code, _ = self._exec("build-detect-py", f"test -f {workdir}/pyproject.toml || test -f {workdir}/setup.py")
+        if code == 0:
+            return f"cd {workdir} && python -m py_compile $(find . -name '*.py' -not -path '*/.*' | head -30) 2>&1"
+        return None
 
     def _put_text_files(self, base_path: str, files: dict[str, str]) -> None:
         if self.container is None:
@@ -622,15 +655,26 @@ async def _build_verified_patches(
     file_manifest = "\n".join(file_manifest_lines)
 
     system = (
-        "You are an expert software engineer fixing a production incident by rewriting files. "
-        "Your ONLY output is a valid JSON object matching the FileRewriteCandidates schema. "
-        "ABSOLUTE RULES (violating any rule means the patch FAILS):\n"
-        "1. candidates: EXACTLY 2 objects.\n"
-        "2. file_path: MUST be chosen from the 'available_files' list in the user prompt. "
-        "   Copy the path character-for-character. NO invented paths. NO paths not in the list.\n"
-        "3. new_content: the COMPLETE updated file content (not a diff). "
-        "   Start from the original file content shown in repo_files and add the fix.\n"
-        "4. summary: one sentence. rollback_plan: one sentence."
+        "You are a principal software engineer performing a surgical, production-safe fix for an incident.\n\n"
+
+        "=== MANDATORY PRE-ANALYSIS (complete ALL steps before writing any code) ===\n"
+        "Before writing any fix, you MUST internally answer the following questions by reading the repo_files:\n"
+        "  A. What is the user ACTUALLY complaining about in plain English? (not what they literally typed — infer intent)\n"
+        "  B. Which exact file(s) in available_files are responsible for the UI or logic the user is seeing?\n"
+        "  C. What exact change in those files will produce the behavior the user expects?\n"
+        "  D. Cross-check the triage context 'interpretations' and 'investigation_plan'. Does your fix address all of them?\n"
+        "  E. Is there a simpler, safer fix that avoids touching unrelated code? Prefer minimal, targeted edits.\n\n"
+
+        "=== ABSOLUTE RULES (violating any rule means the patch is REJECTED) ===\n"
+        "1. candidates: EXACTLY 2 fix candidates. Each candidate must target a DIFFERENT file approach.\n"
+        "2. file_path: MUST be a path copied character-for-character from 'available_files'. "
+        "   NO invented paths. NO guessed filenames. ZERO tolerance for hallucinated paths.\n"
+        "3. new_content: the COMPLETE rewritten file content — not a diff, not a partial snippet. "
+        "   Base it on the original content from repo_files and apply the minimal targeted change.\n"
+        "4. NEVER edit README.md or documentation files as the 'fix'. "
+        "   The fix MUST be in actual source code (e.g., .ts, .tsx, .py, .js, .jsx).\n"
+        "5. summary: one sentence describing exactly what changed and why.\n"
+        "6. rollback_plan: one sentence describing how to undo this change safely.\n"
     )
 
     user_payload = {
@@ -1372,20 +1416,26 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="gpt-4o-mini",
             output_model=IncidentContext,
             system_prompt=(
-                "You are an expert on-call incident triager at a high-traffic engineering team. "
-                "You receive raw alert payloads from monitoring systems (PagerDuty, Datadog, Sentry, GitHub webhooks). "
-                "Your ONLY output is a valid JSON object matching the IncidentContext schema — nothing else. "
-                "Rules: "
-                "1. service: use the leaf service name, not the org/repo path (e.g. 'checkout', not 'acme/checkout'). "
-                "2. environment: must be one of production, staging, ci, demo, or unknown. "
-                "3. severity: classify as sev1 (complete outage), sev2 (partial degradation), sev3 (minor), or sev4 (cosmetic). "
-                "4. error_signature: a short unique identifier for the error class (e.g. 'TypeError: NoneType.order_id'). "
-                "5. impact: one sentence describing the customer-facing effect. "
-                "6. suspected_components: list the file paths or service names most likely involved based on the stack trace. "
-                "7. evidence: list key facts from the payload that support your severity classification. "
-                "8. commit_sha: include if present in the payload, else null. "
-                "9. NEVER invent stack traces, error messages, or file paths not present in the input. "
-                "10. If a field cannot be determined, use null — never guess."
+                "You are an expert on-call incident triager at a high-traffic engineering team.\n\n"
+                "STEP 1 — UNDERSTAND THE USER (most important step):\n"
+                "The 'error' field is a free-text description written by a non-technical user who may not know "
+                "how to articulate a software bug clearly. Your first job is to decode their INTENT. "
+                "Ask yourself: 'What is this person frustrated about? What behavior did they expect vs. what do they see?' "
+                "Use the repository source files provided to verify which components match that description.\n\n"
+                "STEP 2 — CLASSIFY:\n"
+                "Your ONLY output is a valid JSON object matching the IncidentContext schema — nothing else.\n"
+                "1. service: use the leaf service name, not the org/repo path (e.g. 'checkout', not 'acme/checkout').\n"
+                "2. environment: must be one of production, staging, ci, demo, or unknown.\n"
+                "3. severity: classify as sev1 (complete outage), sev2 (partial degradation), sev3 (minor), or sev4 (cosmetic).\n"
+                "4. error_signature: a short unique identifier for the error class (e.g. 'missing-test-credentials-on-login-ui').\n"
+                "5. impact: one sentence describing the customer-facing effect.\n"
+                "6. suspected_components: search the repo_files for the UI component or function that would need to change. "
+                "   List the EXACT file paths that exist in the repository (not guessed paths).\n"
+                "7. evidence: list 3-5 key facts from the user description and repo files that support your analysis.\n"
+                "8. interpretations: list 2-3 different perspectives on what the user could mean — consider both UI and data/config interpretations.\n"
+                "9. investigation_plan: a step-by-step plan for the Patch Generator agent to fix the code without hallucinating paths.\n"
+                "10. NEVER invent stack traces, error messages, or file paths not present in the repo_files.\n"
+                "11. If a field cannot be determined, use null — never guess."
             ),
             fallback=_fallback_triage,
         ),
@@ -1490,13 +1540,14 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.RCA],
             mention=agent_mention(Stage.RCA),
             stage=Stage.RCA,
-            provider=Provider.AIML,
+            provider=Provider.OPENROUTER,
             model_env="RCA_MODEL",
-            default_model="gpt-4o",
+            default_model="openai/gpt-oss-120b:free",
             output_model=RCAReport,
             system_prompt=(
-                "You are an SRE writing a formal, publishable root cause analysis report. "
+                "You are an SRE writing a simple, formal, publishable root cause analysis report summary. "
                 "You receive the winning patch, validation evidence, and the full incident context. "
+                "Keep the final summary simple and easy to read for the end user. "
                 "Your ONLY output is a valid JSON object matching the RCAReport schema — nothing else. "
                 "Rules: "
                 "1. title: a concise incident title (e.g. 'Checkout service crashes on null payload'). "
@@ -1553,6 +1604,8 @@ def _fallback_triage(state: IncidentState) -> IncidentContext:
         impact=_alert_value(state, "impact", "impact requires manual confirmation"),
         suspected_components=[service],
         evidence=[json.dumps(state.raw_alert.payload, separators=(",", ":"))],
+        interpretations=["Fallback: deep analysis required by human"],
+        investigation_plan=["Fallback: require human intervention"],
     )
 
 

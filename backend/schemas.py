@@ -40,6 +40,7 @@ class Severity(StrEnum):
 class Provider(StrEnum):
     AIML = "aimlapi"
     FEATHERLESS = "featherless"
+    OPENROUTER = "openrouter"
 
 
 class RawAlert(BaseModel):
@@ -56,6 +57,8 @@ class IncidentContext(BaseModel):
     impact: str
     suspected_components: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
+    interpretations: list[str] = Field(default_factory=list, description="Different possible interpretations of what the user is trying to say or what the root cause could be based on the repo context.")
+    investigation_plan: list[str] = Field(default_factory=list, description="Step-by-step plan for how the agents should investigate and fix the problem.")
 
 
 class ReproPlan(BaseModel):
