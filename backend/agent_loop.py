@@ -105,6 +105,7 @@ def load_repo_files(repo_path: str, max_files: int = 20) -> dict:
                     with open(full_path, "r", encoding="utf-8") as file:
                         # Store by relative path for cleaner LLM context
                         rel_path = os.path.relpath(full_path, repo_path)
+                        rel_path = rel_path.replace("\\", "/")  # FORCE LINUX PATHS
                         code_map[rel_path] = file.read()
                 except Exception:
                     continue
@@ -568,11 +569,12 @@ def _make_unified_diff(file_path: str, original: str, new_content: str) -> str:
     original_lines = original_clean.splitlines(keepends=True)
     new_lines = new_clean.splitlines(keepends=True)
 
+    safe_file_path = file_path.replace("\\", "/") # FIX PATH SEPARATORS
     diff_parts = difflib.unified_diff(
         original_lines,
         new_lines,
-        fromfile=f"a/{file_path}",
-        tofile=f"b/{file_path}",
+        fromfile=f"a/{safe_file_path}",
+        tofile=f"b/{safe_file_path}",
         # No lineterm arg — use default (\n appended to header-only lines)
     )
     result = "".join(diff_parts)
