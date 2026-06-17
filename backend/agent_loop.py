@@ -62,7 +62,7 @@ class FileRewriteCandidates(BaseModel):
     """LLM returns two file-rewrite candidates; we convert them to proper unified diffs."""
     candidates: list[FilePatch]
 
-DEFAULT_CONTAINER_TIMEOUT_SECONDS = 60
+DEFAULT_CONTAINER_TIMEOUT_SECONDS = 300
 MAX_CONTAINER_TIMEOUT_SECONDS = 600
 
 # Skip heavy dirs when copying host repo into containers (especially on Windows bind mounts).
