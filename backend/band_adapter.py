@@ -17,7 +17,8 @@ STAGE_TRANSITIONS: dict[Stage, Stage | None] = {
     Stage.TRIAGE: Stage.REPRO,
     Stage.REPRO: Stage.TEST,
     Stage.TEST: Stage.FIX,
-    Stage.FIX: Stage.RCA,
+    Stage.FIX: Stage.VALIDATE,
+    Stage.VALIDATE: Stage.RCA,
     Stage.RCA: None,
 }
 
@@ -25,7 +26,8 @@ STAGE_HANDLES: dict[Stage, str] = {
     Stage.TRIAGE: "@zealox587/alert-triager",           
     Stage.REPRO: "@zealox587/incident-reproducer",      
     Stage.TEST: "@zealox587/regression-test-generato", 
-    Stage.FIX: "@zealox587/patch-generator",            
+    Stage.FIX: "@zealox587/patch-generator", 
+    Stage.VALIDATE: "@zealox587/qa-validator",           
     Stage.RCA: "@zealox587/rca-publisher",             
 }
 
@@ -265,6 +267,18 @@ class IncidentBandAdapter(SimpleAdapter[Any]):
         elif self.stage == Stage.FIX:
             state.candidate_patches = output
             state.fix = output.candidates[0] if getattr(output, "candidates", None) else None
+            state.current_stage = Stage.VALIDATE  # ← was Stage.RCA
+        elif self.stage == Stage.VALIDATE:          # ← add this block
+            state.validation = output
+            state.fix = (
+                next(
+                    (c for c in state.candidate_patches.candidates
+                    if c.summary == output.winning_patch_id),
+                    state.fix,
+                )
+                if state.candidate_patches and output.winning_patch_id
+                else state.fix
+            )
             state.current_stage = Stage.RCA
         elif self.stage == Stage.RCA:
             state.rca = output
