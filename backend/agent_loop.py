@@ -9,7 +9,7 @@ import shlex
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Literal 
 
 from backend.agent_context import build_stage_prompt
 from backend.alert_normalize import normalize_alert
@@ -45,6 +45,8 @@ from backend.schemas import (
     Severity,
     Stage,
     ValidationSwarmResult,
+    PatchResult,        
+    ValidationReport,
 )
 
 Fallback = Callable[[IncidentState], BaseModel]
@@ -135,7 +137,7 @@ class IncidentAgent:
         active_repo_path = state.repo_path or state.raw_alert.payload.get("repo_path")
 
         # INJECT REAL CODE: Only for agents that need to see code
-        if active_repo_path and self.stage in {Stage.REPRO, Stage.TEST, Stage.FIX}:
+        if active_repo_path and self.stage in {Stage.REPRO, Stage.TEST, Stage.FIX, Stage.VALIDATE}:
             state_dict["repository_files"] = load_repo_files(active_repo_path)
 
         prompt = json.dumps(state_dict, separators=(",", ":"))
@@ -1595,8 +1597,65 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             ),
             fallback=_fallback_rca,
         ),
+        Stage.VALIDATE: IncidentAgent(
+    name=AGENT_DISPLAY_NAMES[Stage.VALIDATE],
+    mention=agent_mention(Stage.VALIDATE),
+    stage=Stage.VALIDATE,
+    provider=Provider.FEATHERLESS,
+    model_env="VALIDATION_MODEL",
+    default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
+    output_model=ValidationReport,
+    system_prompt=(
+        "You are a senior QA Engineer responsible for validating candidate patches against a regression test suite.\n\n"
+        "You receive:\n"
+        "  - Two candidate unified diffs (CandidatePatches) from the Patch Generator\n"
+        "  - The regression test written by the Test Architect\n"
+        "  - Pass 1 Docker execution logs (pre-patch baseline)\n"
+        "  - The full repository source files\n\n"
+        "Your ONLY output is a valid JSON object matching the ValidationReport schema — nothing else.\n\n"
+        "Rules:\n"
+        "1. patch_results: for EACH candidate patch, produce a PatchResult entry containing:\n"
+        "   a) patch_id: the identifier from CandidatePatches (e.g. 'patch_a', 'patch_b').\n"
+        "   b) applies_cleanly: true if the diff applies without hunk failures, false otherwise.\n"
+        "   c) test_exit_code: the exit code you predict the regression test will produce after the patch (0 = pass).\n"
+        "   d) test_output_summary: 2-3 sentences describing what the test verifies and what the patched code does.\n"
+        "   e) side_effects: list any unintended behaviour changes, new failure modes, or regressions the patch introduces.\n"
+        "      If none, return an empty list.\n"
+        "   f) correctness_score: integer 0-10 rating how completely this patch resolves the root cause.\n\n"
+        "2. winning_patch_id: the patch_id of the candidate that achieves exit code 0, highest correctness_score,\n"
+        "   and fewest side effects. If both patches fail, set to null.\n\n"
+        "3. confidence: one of 'high', 'medium', or 'low'.\n"
+        "   - high: winning patch passes all tests with no side effects.\n"
+        "   - medium: winning patch passes but has minor side effects or residual uncertainty.\n"
+        "   - low: both patches fail or the evidence is ambiguous.\n\n"
+        "4. validation_notes: a single paragraph explaining your reasoning — which patch won, why the other lost,\n"
+        "   and any caveats the RCA agent should be aware of.\n\n"
+        "5. regression_risk: one of 'none', 'low', 'medium', or 'high' — your assessment of how likely the\n"
+        "   winning patch is to introduce a regression in adjacent code paths.\n\n"
+        "6. suggested_followup_tests: list 2-4 additional test cases (as plain English descriptions) that should\n"
+        "   be written to improve coverage around the patched area.\n\n"
+        "CONSTRAINTS:\n"
+        "- Do NOT invent stack traces, log lines, or test output not present in the provided materials.\n"
+        "- Do NOT apply patches speculatively — reason about them statically against the repo source.\n"
+        "- If a patch modifies a file not present in repo_files, mark applies_cleanly as false and explain in side_effects.\n"
+        "- If confidence is 'low', set winning_patch_id to null and explain fully in validation_notes."
+    ),
+    fallback=_fallback_validation,
+),
     }
 
+
+
+
+def _fallback_validation(error: Exception) -> ValidationReport:
+    return ValidationReport(
+        patch_results=[],
+        winning_patch_id=None,
+        confidence="low",
+        validation_notes=f"Validation agent failed with error: {str(error)}. Manual review required.",
+        regression_risk="high",
+        suggested_followup_tests=[],
+    )
 
 def _alert_value(state: IncidentState, key: str, default: str) -> str:
     value = state.raw_alert.payload.get(key, default)
