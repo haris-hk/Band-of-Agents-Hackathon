@@ -1047,6 +1047,16 @@ class IncidentOrchestrator:
         )
         yield self._event(state, Stage.TRIAGE, "orchestrator", "queued", {"alert": alert})
 
+        # ==========================================
+        # ADD THIS BLOCK HERE TO FIX THE CLONE ERROR
+        # ==========================================
+        await self._prepare_repository(state, alert)
+        if state.current_stage == Stage.FAILED:
+            async for event in self._finalize_run(state, alert):
+                yield event
+            return
+        # ==========================================
+
         while state.current_stage not in {Stage.DONE, Stage.FAILED}:
 
             if state.steps_run >= state.max_steps:
