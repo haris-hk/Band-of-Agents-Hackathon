@@ -1471,7 +1471,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
                 "Rules: "
                 "1. title: a concise incident title (e.g. 'Checkout service crashes on null payload'). "
                 "2. incident_summary: 2-3 sentences covering: what failed, when it was detected, who was impacted. "
-                "3. customer_impact: one sentence on the end-user effect (e.g. '100% of checkout requests failed'). "
+                "3. customer_impact: one sentence on the end-user effect (e.g. '100 percent of checkout requests failed'). "
                 "4. root_cause: MUST be the EXACT technical cause from the repro logs. "
                 "   - If the error is a SyntaxError due to a missing colon, say: "
                 "     'The function definition on line X was missing a colon (:), causing a SyntaxError.' "
