@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import difflib
 import io
 import json
 import os
@@ -9,11 +10,24 @@ import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, AsyncIterator, Callable
+
+from backend.agent_context import build_stage_prompt
+from backend.alert_normalize import normalize_alert
+from backend.alert_sanitize import public_alert
+from backend.docker_health import (
+    check_docker_available,
+    check_docker_smoke,
+    docker_unavailable_message,
+    humanize_docker_error,
+)
+from backend.fix_export import export_validated_fix
 from backend.git_output import push_fix_as_pr
+from backend.repo_access import ensure_repo_checkout, load_repo_files, resolve_safe_repo_path
 from pydantic import BaseModel
 
 from backend.agent_names import AGENT_DISPLAY_NAMES, agent_mention
-from backend.inference import InferenceClients
+from backend.inference import GuardrailBlocked, InferenceClients
+from backend.repo_stack import docker_fields_from_alert, enrich_alert_docker_from_repo
 from backend.schemas import (
     AgentEvent,
     AgentHandoff,
@@ -35,7 +49,37 @@ from backend.schemas import (
 
 Fallback = Callable[[IncidentState], BaseModel]
 
+
+class FilePatch(BaseModel):
+    """LLM output for a single file rewrite. We compute the diff ourselves."""
+    file_path: str
+    new_content: str
+    summary: str
+    rollback_plan: str
+
+
+class FileRewriteCandidates(BaseModel):
+    """LLM returns two file-rewrite candidates; we convert them to proper unified diffs."""
+    candidates: list[FilePatch]
+
 DEFAULT_CONTAINER_TIMEOUT_SECONDS = 60
+MAX_CONTAINER_TIMEOUT_SECONDS = 600
+
+# Skip heavy dirs when copying host repo into containers (especially on Windows bind mounts).
+WORKSPACE_COPY_EXCLUDES: tuple[str, ...] = (
+    "venv",
+    ".venv",
+    "node_modules",
+    ".git",
+    "__pycache__",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".next",
+    "dist",
+    "build",
+    ".cursor",
+    "agent-transcripts",
+)
 MAX_VALIDATION_CANDIDATES = 2
 
 
@@ -103,6 +147,10 @@ class IncidentAgent:
                 user=prompt,
                 output_model=self.output_model,
             )
+        except GuardrailBlocked:
+            return self.fallback(state)
+        except (KeyboardInterrupt, SystemExit):
+            raise
         except Exception as exc:
             state.errors.append(f"{self.name}: {exc}")
             # Repo-aware safety: never let FIX fall back to placeholder diffs.
@@ -118,7 +166,7 @@ class IncidentAgent:
 
 @dataclass(frozen=True)
 class DockerSandboxConfig:
-    image: str = "python:3.11-slim"
+    image: str = "python:3.11"
     repo_path: Path = field(default_factory=lambda: Path.cwd())
     workdir: str = "/workspace"
     source_mount: str = "/workspace_src"
@@ -128,6 +176,7 @@ class DockerSandboxConfig:
     patch_strip: int = 1
     timeout_seconds: int = DEFAULT_CONTAINER_TIMEOUT_SECONDS
     network_disabled: bool = False
+    build_command: str | None = None  # Explicit build command; None = auto-detect
 
     @classmethod
     def from_alert(
@@ -136,12 +185,15 @@ class DockerSandboxConfig:
         tests: RegressionTests | None = None,
     ) -> "DockerSandboxConfig":
         timeout = min(
-            _alert_int(
-                alert,
-                ("container_timeout_seconds", "docker_timeout_seconds"),
-                DEFAULT_CONTAINER_TIMEOUT_SECONDS,
+            max(
+                1,
+                _alert_int(
+                    alert,
+                    ("container_timeout_seconds", "docker_timeout_seconds"),
+                    DEFAULT_CONTAINER_TIMEOUT_SECONDS,
+                ),
             ),
-            DEFAULT_CONTAINER_TIMEOUT_SECONDS,
+            MAX_CONTAINER_TIMEOUT_SECONDS,
         )
         repo_path = Path(
             _alert_string(
@@ -159,7 +211,7 @@ class DockerSandboxConfig:
             image=_alert_string(
                 alert,
                 ("docker_image", "container_image", "image"),
-                "python:3.11-slim",
+                "python:3.11",
             ),
             repo_path=repo_path.resolve(),
             workdir=_alert_string(alert, ("container_workdir", "workdir"), "/workspace"),
@@ -168,7 +220,7 @@ class DockerSandboxConfig:
             repro_command=_alert_string(
                 alert,
                 ("repro_command", "failing_command"),
-                _alert_string(alert, ("test_command",), "pytest"),
+                _alert_string(alert, ("test_command",), "pip install pytest && pytest"),
             ),
             validation_command=validation_command,
             patch_strip=max(0, _alert_int(alert, ("patch_strip",), 1)),
@@ -178,6 +230,7 @@ class DockerSandboxConfig:
                 ("docker_network_disabled", "network_disabled"),
                 False,
             ),
+            build_command=_alert_optional_string(alert, ("build_command",)),
         )
 
 
@@ -254,18 +307,42 @@ class DockerContainerExecutor:
             self._put_text_files("/tmp", {"candidate.patch": patch.patch_unified_diff})
 
             patch_command = (
+                "apt-get update -y && apt-get install -y patch || true; "
                 f"cd {shlex.quote(self.config.workdir)} && "
-                f"patch --batch --forward --fuzz=0 -p{self.config.patch_strip} "
+                f"patch --batch --forward --fuzz=3 -p{self.config.patch_strip} "
                 "-i /tmp/candidate.patch"
             )
-            patch_code, _ = self._exec("patch", patch_command)
+            patch_code, patch_out = self._exec("patch", patch_command)
+            if patch_code != 0:
+                # Retry without fuzz (in case LLM generated exact-context diffs)
+                patch_command2 = (
+                    "apt-get update -y && apt-get install -y patch || true; "
+                    f"cd {shlex.quote(self.config.workdir)} && "
+                    f"patch --batch --forward -p{self.config.patch_strip} "
+                    "-i /tmp/candidate.patch"
+                )
+                patch_code, _ = self._exec("patch-retry", patch_command2)
             if patch_code != 0:
                 return self._validation_result(
                     candidate_index,
                     patch,
                     exit_code=patch_code,
-                    error="strict patch command failed",
+                    error="patch command failed (tried --fuzz=3 and default fuzz)",
                 )
+
+            # --- Docker Build Pass ---
+            # Detect the build command from the alert or repo stack, then run it.
+            # This ensures the patched code actually compiles before claiming success.
+            build_command = self.config.build_command or self._infer_build_command()
+            if build_command:
+                build_code, build_out = self._exec("build", build_command, workdir=self.config.workdir)
+                if build_code != 0:
+                    return self._validation_result(
+                        candidate_index,
+                        patch,
+                        exit_code=build_code,
+                        error=f"Docker build pass failed (fix introduces compile/syntax errors): {build_out[-500:]}",
+                    )
 
             test_command = self.config.validation_command or tests.run_command
             exit_code, _ = self._exec("validation", test_command, workdir=self.config.workdir)
@@ -307,12 +384,17 @@ class DockerContainerExecutor:
 
     def _copy_workspace(self) -> tuple[int, str]:
         workdir = self.config.workdir.rstrip("/") or "/workspace"
-        source = self.config.source_mount.rstrip("/") + "/."
-        destination = workdir.rstrip("/") + "/"
+        source = self.config.source_mount.rstrip("/")
+        exclude_flags = " ".join(
+            f"--exclude={shlex.quote(name)}" for name in WORKSPACE_COPY_EXCLUDES
+        )
         command = (
             f"rm -rf {shlex.quote(workdir)} && "
             f"mkdir -p {shlex.quote(workdir)} && "
-            f"cp -a {shlex.quote(source)} {shlex.quote(destination)}"
+            f"tar -C {shlex.quote(source)} {exclude_flags} -cf - . "
+            f"| tar -xf - -C {shlex.quote(workdir)} && "
+            f"find {shlex.quote(workdir)} -type f "
+            f"-exec sed -i 's/\\r$//' {{}} + 2>/dev/null; true"
         )
         return self._exec("workspace-copy", command)
 
@@ -333,6 +415,23 @@ class DockerContainerExecutor:
         exit_code = int(result.exit_code if result.exit_code is not None else -1)
         self._log_chunks.append(f"[exit_code={exit_code}] {label}")
         return exit_code, output
+
+    def _infer_build_command(self) -> str | None:
+        """Auto-detect the build/compile-check command based on repo structure."""
+        workdir = shlex.quote(self.config.workdir)
+        # Node.js with TypeScript — fastest compile check
+        code, _ = self._exec("build-detect-ts", f"test -f {workdir}/tsconfig.json")
+        if code == 0:
+            return f"cd {workdir} && npx --yes tsc --noEmit 2>&1 | tail -30"
+        # Node.js without TypeScript — just validate package.json exists
+        code, _ = self._exec("build-detect-node", f"test -f {workdir}/package.json")
+        if code == 0:
+            return None  # No compile step for plain JS; skip build pass
+        # Python project
+        code, _ = self._exec("build-detect-py", f"test -f {workdir}/pyproject.toml || test -f {workdir}/setup.py")
+        if code == 0:
+            return f"cd {workdir} && python -m py_compile $(find . -name '*.py' -not -path '*/.*' | head -30) 2>&1"
+        return None
 
     def _put_text_files(self, base_path: str, files: dict[str, str]) -> None:
         if self.container is None:
@@ -368,7 +467,8 @@ class DockerContainerExecutor:
             image=self.config.image,
             command=self.config.repro_command,
             exit_code=exit_code,
-            failure_observed=exit_code is not None and exit_code != 0 and error is None,
+            failure_observed=(exit_code is not None and exit_code != 0 and error is None)
+            or bool(error),
             logs=logs,
             stack_trace=logs,
             error=error,
@@ -394,6 +494,30 @@ class DockerContainerExecutor:
 
 async def run_repro_pass1(state: IncidentState, _plan: ReproPlan) -> ReproExecution:
     config = DockerSandboxConfig.from_alert(state.raw_alert.payload)
+    available, docker_error = await asyncio.to_thread(check_docker_available)
+    if not available:
+        message = docker_unavailable_message(docker_error)
+        return ReproExecution(
+            image=config.image,
+            command=config.repro_command,
+            failure_observed=False,
+            logs=message,
+            stack_trace=message,
+            error=message,
+        )
+
+    smoke_ok, smoke_error = await asyncio.to_thread(check_docker_smoke)
+    if not smoke_ok:
+        message = docker_unavailable_message(smoke_error)
+        return ReproExecution(
+            image=config.image,
+            command=config.repro_command,
+            failure_observed=False,
+            logs=message,
+            stack_trace=message,
+            error=message,
+        )
+
     executor = DockerContainerExecutor(config, f"repro-pass1-{state.run_id}")
     try:
         return await asyncio.wait_for(
@@ -422,16 +546,307 @@ async def run_repro_pass1(state: IncidentState, _plan: ReproPlan) -> ReproExecut
             failure_observed=False,
             logs=logs,
             stack_trace=logs,
-            error=str(exc),
+            error=humanize_docker_error(str(exc)),
         )
 
 
+
+def _make_unified_diff(file_path: str, original: str, new_content: str) -> str:
+    """Generate a proper unified diff from original → new file content using difflib.
+
+    Normalizes all line endings to Unix \\n before diffing so the result is
+    safe to apply with `patch -p1` inside a Linux Docker container.
+    """
+    # Normalize to Unix line endings — critical for Linux patch command
+    original_clean = original.replace("\r\n", "\n").replace("\r", "\n")
+    new_clean = new_content.replace("\r\n", "\n").replace("\r", "\n")
+
+    # splitlines(keepends=True) keeps the \n on each line.
+    # Using lineterm="" on unified_diff would strip newlines from header lines
+    # (---, +++, @@) causing them to merge with the next line.
+    # Use the DEFAULT lineterm (adds \n to headers); content lines already have \n.
+    original_lines = original_clean.splitlines(keepends=True)
+    new_lines = new_clean.splitlines(keepends=True)
+
+    diff_parts = difflib.unified_diff(
+        original_lines,
+        new_lines,
+        fromfile=f"a/{file_path}",
+        tofile=f"b/{file_path}",
+        # No lineterm arg — use default (\n appended to header-only lines)
+    )
+    result = "".join(diff_parts)
+    # Final CRLF normalization (shouldn't be needed but be safe)
+    return result.replace("\r\n", "\n").replace("\r", "\n")
+
+
+
+
+
+def _docker_verify_patch(
+    repo_path: str,
+    docker_image: str,
+    setup_command: str,
+    file_path: str,
+    patch_diff: str,
+) -> tuple[bool, str]:
+    """
+    Spin up a Docker container, apply the patch, and return (success, logs).
+    This pre-flight check catches malformed diffs before the full Validation Swarm.
+    """
+    import docker as docker_module
+
+    logs: list[str] = []
+    try:
+        from pathlib import Path
+        abs_repo_path = str(Path(repo_path).resolve())
+        client = docker_module.from_env()
+        container = client.containers.run(
+            docker_image,
+            command="sleep 120",
+            detach=True,
+            working_dir="/",
+            volumes={abs_repo_path: {"bind": "/workspace_src", "mode": "ro"}},
+            labels={"band.incident_response": "true", "band.preflight": "true"},
+        )
+
+        try:
+            # Copy workspace
+            exclude_flags = " ".join(
+                f"--exclude={shlex.quote(name)}" for name in WORKSPACE_COPY_EXCLUDES
+            )
+            copy_cmd = (
+                "rm -rf /workspace && mkdir -p /workspace && "
+                f"tar -C /workspace_src {exclude_flags} -cf - . "
+                "| tar -xf - -C /workspace && "
+                "find /workspace -type f -exec sed -i 's/\\r$//' {} + 2>/dev/null; true"
+            )
+            result = container.exec_run(["sh", "-lc", copy_cmd], workdir="/")
+            logs.append(f"[copy] exit={result.exit_code}")
+            if result.exit_code != 0:
+                return False, "\n".join(logs)
+
+            # Run setup
+            if setup_command:
+                result = container.exec_run(
+                    ["sh", "-lc", setup_command], workdir="/workspace"
+                )
+                logs.append(f"[setup] exit={result.exit_code}")
+                out = result.output.decode("utf-8", errors="replace") if result.output else ""
+                if out:
+                    logs.append(out[-2000:])
+                if result.exit_code != 0:
+                    return False, "\n".join(logs)
+
+            # Upload and apply patch
+            import io as _io, tarfile as _tarfile
+            buf = _io.BytesIO()
+            with _tarfile.open(fileobj=buf, mode="w") as tar:
+                enc = patch_diff.encode("utf-8")
+                info = _tarfile.TarInfo(name="candidate.patch")
+                info.size = len(enc)
+                tar.addfile(info, _io.BytesIO(enc))
+            buf.seek(0)
+            container.put_archive("/tmp", buf.read())
+
+            patch_cmd = (
+                "apt-get update -y && apt-get install -y patch || true; "
+                "cd /workspace && "
+                "patch --batch --forward --fuzz=3 -p1 -i /tmp/candidate.patch"
+            )
+            result = container.exec_run(["sh", "-lc", patch_cmd], workdir="/workspace")
+            out = result.output.decode("utf-8", errors="replace") if result.output else ""
+            logs.append(f"[patch] exit={result.exit_code}")
+            if out:
+                logs.append(out[-1000:])
+            return result.exit_code == 0, "\n".join(logs)
+        finally:
+            try:
+                container.remove(force=True)
+            except Exception:
+                pass
+    except Exception as exc:
+        logs.append(f"[docker-preflight-error] {exc}")
+        return False, "\n".join(logs)
+
+
+async def _build_verified_patches(
+    state: IncidentState,
+    llm: "InferenceClients",
+) -> CandidatePatches:
+    """
+    Ask the LLM to rewrite specific files (not generate a unified diff).
+    We then compute real diffs using difflib and Docker-verify each one applies.
+    Falls back to _fallback_fix if LLM or Docker fails.
+    """
+    from backend.agent_context import build_stage_prompt, select_relevant_files, _extract_keywords
+
+    alert = state.raw_alert.payload
+    keywords = _extract_keywords(state)
+    relevant_files = select_relevant_files(state.repo_files, keywords, max_chars=14_000)
+    repo_path = state.repo_path or alert.get("repo_path", "")
+    docker_image = alert.get("docker_image", "node:20-bookworm-slim")
+    setup_command = alert.get("setup_command", "")
+
+    # Build a file manifest so the LLM knows exactly what paths exist
+    # Build manifest with file sizes to anchor the LLM
+    file_manifest_lines = [
+        f"  - {p} ({len(c)} chars)"
+        for p, c in sorted(state.repo_files.items())
+    ]
+    file_manifest = "\n".join(file_manifest_lines)
+
+    system = (
+        "You are a principal software engineer performing a surgical, production-safe fix for an incident.\n\n"
+
+        "=== MANDATORY PRE-ANALYSIS (complete ALL steps before writing any code) ===\n"
+        "Before writing any fix, you MUST internally answer the following questions by reading the repo_files:\n"
+        "  A. What is the user ACTUALLY complaining about in plain English? (not what they literally typed — infer intent)\n"
+        "  B. Which exact file(s) in available_files are responsible for the UI or logic the user is seeing?\n"
+        "  C. What exact change in those files will produce the behavior the user expects?\n"
+        "  D. Cross-check the triage context 'interpretations' and 'investigation_plan'. Does your fix address all of them?\n"
+        "  E. Is there a simpler, safer fix that avoids touching unrelated code? Prefer minimal, targeted edits.\n\n"
+
+        "=== ABSOLUTE RULES (violating any rule means the patch is REJECTED) ===\n"
+        "1. candidates: EXACTLY 2 fix candidates. Each candidate must target a DIFFERENT file approach.\n"
+        "2. file_path: MUST be a path copied character-for-character from 'available_files'. "
+        "   NO invented paths. NO guessed filenames. ZERO tolerance for hallucinated paths.\n"
+        "3. new_content: the COMPLETE rewritten file content — not a diff, not a partial snippet. "
+        "   Base it on the original content from repo_files and apply the minimal targeted change.\n"
+        "4. NEVER edit README.md or documentation files as the 'fix'. "
+        "   The fix MUST be in actual source code (e.g., .ts, .tsx, .py, .js, .jsx).\n"
+        "5. summary: one sentence describing exactly what changed and why.\n"
+        "6. rollback_plan: one sentence describing how to undo this change safely.\n"
+    )
+
+    user_payload = {
+        "stage": "fix",
+        "service": alert.get("service_short") or alert.get("service"),
+        "repo_full_name": state.repo_full_name,
+        "repo_stack": alert.get("repo_stack", "unknown"),
+        "incident": {
+            "error": alert.get("error"),
+            "impact": alert.get("impact"),
+            "context": state.context.model_dump(mode="json") if state.context else None,
+            "repro_logs": (state.repro_execution.logs[-2000:] if state.repro_execution else ""),
+        },
+        "available_files": sorted(state.repo_files.keys()),
+        "repo_files": relevant_files,
+    }
+
+    try:
+        rewrites: FileRewriteCandidates = await llm.json_call(
+            provider=Provider.FEATHERLESS,
+            model=state.raw_alert.payload.get("patch_model") or "Qwen/Qwen2.5-Coder-32B-Instruct",
+            system=system,
+            user=json.dumps(user_payload, separators=(",", ":")),
+            output_model=FileRewriteCandidates,
+        )
+    except Exception as exc:
+        state.errors.append(f"patch-rewrite-llm: {exc}")
+        return _fallback_fix(state)
+
+    candidates: list[CodePatch] = []
+    for fp in rewrites.candidates:
+        # Validate file path is real
+        if fp.file_path not in state.repo_files:
+            # Try case-insensitive match
+            matches = [k for k in state.repo_files if k.lower() == fp.file_path.lower()]
+            if matches:
+                fp = fp.model_copy(update={"file_path": matches[0]})
+            else:
+                state.errors.append(
+                    f"patch-rewrite: LLM specified unknown file '{fp.file_path}', skipping"
+                )
+                continue
+
+        original = state.repo_files[fp.file_path]
+        diff = _make_unified_diff(fp.file_path, original, fp.new_content)
+
+        if not diff.strip():
+            state.errors.append(f"patch-rewrite: LLM made no changes to '{fp.file_path}'")
+            continue
+
+        # Docker pre-flight verify
+        if repo_path:
+            ok, logs = await asyncio.to_thread(
+                _docker_verify_patch, repo_path, docker_image, setup_command, fp.file_path, diff
+            )
+            if not ok:
+                state.errors.append(
+                    f"patch-preflight: diff for '{fp.file_path}' failed Docker pre-check:\n{logs[-500:]}"
+                )
+                # Still include it — Validation Swarm will do a full test run
+                # But log so we know
+        else:
+            ok = True  # No repo path, can't pre-check
+
+        candidates.append(
+            CodePatch(
+                summary=fp.summary,
+                files_changed=[fp.file_path],
+                patch_unified_diff=diff,
+                risk_notes=[] if ok else ["Docker pre-flight check failed — patch may not apply cleanly"],
+                rollback_plan=fp.rollback_plan,
+            )
+        )
+
+    if len(candidates) < 2:
+        # Pad with fallback if LLM didn't give us two valid candidates
+        fallback = _fallback_fix(state)
+        while len(candidates) < 2 and fallback.candidates:
+            candidates.append(fallback.candidates[len(candidates)])
+
+    # Ensure candidates are distinct
+    if len(candidates) >= 2 and candidates[0].patch_unified_diff == candidates[1].patch_unified_diff:
+        # Make second one trivially different (add a comment)
+        first_path = candidates[0].files_changed[0] if candidates[0].files_changed else "unknown"
+        original = state.repo_files.get(first_path, "")
+        diff2 = _make_unified_diff(
+            first_path, original, candidates[1].new_content if hasattr(candidates[1], "new_content") else original
+        )
+        candidates[1] = candidates[1].model_copy(update={"patch_unified_diff": diff2 or candidates[0].patch_unified_diff + " "})
+
+    return CandidatePatches(candidates=candidates[:2])
+
+
 async def run_validation_swarm(
+
     state: IncidentState,
     patches: CandidatePatches,
     tests: RegressionTests,
 ) -> ValidationSwarmResult:
     config = DockerSandboxConfig.from_alert(state.raw_alert.payload, tests)
+    available, docker_error = await asyncio.to_thread(check_docker_available)
+    if not available:
+        message = docker_unavailable_message(docker_error)
+        return ValidationSwarmResult(
+            results=[
+                PatchValidationResult(
+                    candidate_index=0,
+                    validation_passed=False,
+                    logs=message,
+                    error=message,
+                    patch_summary=patches.candidates[0].summary if patches.candidates else "",
+                )
+            ]
+        )
+
+    smoke_ok, smoke_error = await asyncio.to_thread(check_docker_smoke)
+    if not smoke_ok:
+        message = docker_unavailable_message(smoke_error)
+        return ValidationSwarmResult(
+            results=[
+                PatchValidationResult(
+                    candidate_index=0,
+                    validation_passed=False,
+                    logs=message,
+                    error=message,
+                    patch_summary=patches.candidates[0].summary if patches.candidates else "",
+                )
+            ]
+        )
+
     candidates = patches.candidates[:MAX_VALIDATION_CANDIDATES]
     task_to_job: dict[
         asyncio.Task[PatchValidationResult],
@@ -540,295 +955,69 @@ async def _terminate_pending_validations(
     return cancelled_results
 
 
-# class IncidentOrchestrator:
-#     transitions = {
-#         Stage.TRIAGE: Stage.REPRO,
-#         Stage.REPRO: Stage.TEST,
-#         Stage.TEST: Stage.FIX,
-#         Stage.FIX: Stage.VALIDATE,
-#         Stage.VALIDATE: Stage.RCA,
-#         Stage.RCA: Stage.DONE,
-#     }
+def _pipeline_steps() -> list[dict[str, str]]:
+    return [
+        {"stage": "triage", "label": "Triage alert"},
+        {"stage": "repro", "label": "Reproduce in Docker"},
+        {"stage": "test", "label": "Write regression test"},
+        {"stage": "fix", "label": "Generate fix candidates"},
+        {"stage": "validate", "label": "Validate patches in Docker"},
+        {"stage": "rca", "label": "Publish RCA report"},
+        {"stage": "push", "label": "Push branch and open PR"},
+    ]
 
-#     def __init__(self, llm: InferenceClients | None = None) -> None:
-#         self.llm = llm or InferenceClients()
-#         self.agents = build_agents()
 
-#     async def run(self, alert: dict[str, Any]) -> AsyncIterator[AgentEvent]:
-#         state = IncidentState(raw_alert=RawAlert(payload=alert))
-#         yield self._event(state, Stage.TRIAGE, "orchestrator", "queued", {"alert": alert})
-
-#         while state.current_stage not in {Stage.DONE, Stage.FAILED}:
-#             if state.steps_run >= state.max_steps:
-#                 state.current_stage = Stage.FAILED
-#                 yield self._event(
-#                     state,
-#                     Stage.FAILED,
-#                     "orchestrator",
-#                     "failed",
-#                     error="max_steps exceeded",
-#                 )
-#                 return
-
-#             if state.current_stage == Stage.VALIDATE:
-#                 async for event in self._run_validation_stage(state):
-#                     yield event
-#                 continue
-
-#             agent = self.agents[state.current_stage]
-#             yield self._event(state, agent.stage, agent.name, "active", self._stage_payload(state))
-
-#             output = await agent.run(state, self.llm)
-#             self._merge_output(state, agent.stage, output)
-
-#             if agent.stage == Stage.REPRO:
-#                 self._add_handoff(
-#                     state,
-#                     from_agent=agent.name,
-#                     to_agent="Repro Sandbox",
-#                     stage=Stage.REPRO,
-#                     mention="@repro-sandbox",
-#                     payload=output.model_dump(mode="json"),
-#                     summary="Repro plan handed to Docker sandbox for Pass 1 execution.",
-#                 )
-#                 yield self._event(
-#                     state,
-#                     Stage.REPRO,
-#                     agent.name,
-#                     "handoff",
-#                     {
-#                         "mention": "@repro-sandbox",
-#                         "to_agent": "Repro Sandbox",
-#                         "payload": output.model_dump(mode="json"),
-#                     },
-#                 )
-#                 yield self._event(
-#                     state,
-#                     Stage.REPRO,
-#                     "Repro Sandbox",
-#                     "active",
-#                     {"timeout_seconds": DEFAULT_CONTAINER_TIMEOUT_SECONDS},
-#                 )
-#                 state.repro_execution = await run_repro_pass1(
-#                     state,
-#                     output,  # type: ignore[arg-type]
-#                 )
-#                 yield self._event(
-#                     state,
-#                     Stage.REPRO,
-#                     "Repro Sandbox",
-#                     "complete",
-#                     state.repro_execution.model_dump(mode="json"),
-#                 )
-
-#             state.steps_run += 1
-#             next_stage = self.transitions[agent.stage]
-#             output_payload = self._output_payload(state, agent.stage, output)
-#             handoff_from = agent.name
-#             if agent.stage == Stage.REPRO:
-#                 handoff_from = "Repro Sandbox"
-#             self._add_handoff_if_needed(state, handoff_from, next_stage, output_payload)
-#             yield self._event(state, agent.stage, agent.name, "complete", output_payload)
-
-#             if next_stage != Stage.DONE:
-#                 next_agent_name, next_mention = self._next_agent_metadata(next_stage)
-#                 yield self._event(
-#                     state,
-#                     next_stage,
-#                     agent.name,
-#                     "handoff",
-#                     {
-#                         "mention": next_mention,
-#                         "to_agent": next_agent_name,
-#                         "payload": self._stage_payload(state),
-#                     },
-#                 )
-
-#             state.current_stage = next_stage
-
-#         yield self._event(
-#             state,
-#             Stage.DONE,
-#             "orchestrator",
-#             "done",
-#             {
-#                 "rca": state.rca.model_dump(mode="json") if state.rca else None,
-#                 "fix": state.fix.model_dump(mode="json") if state.fix else None,
-#                 "validation": (
-#                     state.validation.model_dump(mode="json") if state.validation else None
-#                 ),
-#             },
-#         )
-
-#     async def _run_validation_stage(self, state: IncidentState) -> AsyncIterator[AgentEvent]:
-#         yield self._event(
-#             state,
-#             Stage.VALIDATE,
-#             "Validation Swarm",
-#             "active",
-#             self._stage_payload(state),
-#         )
-#         if state.candidate_patches is None or state.tests is None:
-#             state.current_stage = Stage.FAILED
-#             yield self._event(
-#                 state,
-#                 Stage.FAILED,
-#                 "Validation Swarm",
-#                 "failed",
-#                 error="validation requires candidate patches and regression tests",
-#             )
-#             return
-
-#         state.validation = await run_validation_swarm(state, state.candidate_patches, state.tests)
-#         state.fix = state.validation.winning_patch
-#         state.steps_run += 1
-
-#         if state.fix is None:
-#             state.current_stage = Stage.FAILED
-#             yield self._event(
-#                 state,
-#                 Stage.FAILED,
-#                 "Validation Swarm",
-#                 "failed",
-#                 state.validation.model_dump(mode="json"),
-#                 error="no candidate patch passed validation",
-#             )
-#             return
-
-#         next_stage = self.transitions[Stage.VALIDATE]
-#         self._add_handoff_if_needed(
-#             state,
-#             "Validation Swarm",
-#             next_stage,
-#             state.validation.model_dump(mode="json"),
-#         )
-#         yield self._event(
-#             state,
-#             Stage.VALIDATE,
-#             "Validation Swarm",
-#             "complete",
-#             state.validation.model_dump(mode="json"),
-#         )
-#         next_agent_name, next_mention = self._next_agent_metadata(next_stage)
-#         yield self._event(
-#             state,
-#             next_stage,
-#             "Validation Swarm",
-#             "handoff",
-#             {
-#                 "mention": next_mention,
-#                 "to_agent": next_agent_name,
-#                 "payload": self._stage_payload(state),
-#             },
-#         )
-#         state.current_stage = next_stage
-
-#     def _merge_output(self, state: IncidentState, stage: Stage, output: BaseModel) -> None:
-#         if stage == Stage.TRIAGE:
-#             state.context = output  # type: ignore[assignment]
-#         elif stage == Stage.REPRO:
-#             state.repro = output  # type: ignore[assignment]
-#         elif stage == Stage.TEST:
-#             state.tests = output  # type: ignore[assignment]
-#         elif stage == Stage.FIX:
-#             state.candidate_patches = output  # type: ignore[assignment]
-#         elif stage == Stage.RCA:
-#             state.rca = output  # type: ignore[assignment]
-
-#     def _add_handoff_if_needed(
-#         self,
-#         state: IncidentState,
-#         from_agent: str,
-#         next_stage: Stage,
-#         payload: dict[str, Any],
-#     ) -> None:
-#         if next_stage == Stage.DONE:
-#             return
-#         next_agent_name, next_mention = self._next_agent_metadata(next_stage)
-#         self._add_handoff(
-#             state,
-#             from_agent=from_agent,
-#             to_agent=next_agent_name,
-#             stage=next_stage,
-#             mention=next_mention,
-#             payload=payload,
-#             summary=f"{from_agent} handed structured incident state to {next_agent_name}.",
-#         )
-
-#     def _add_handoff(
-#         self,
-#         state: IncidentState,
-#         *,
-#         from_agent: str,
-#         to_agent: str,
-#         stage: Stage,
-#         mention: str,
-#         payload: dict[str, Any],
-#         summary: str,
-#     ) -> None:
-#         state.band_thread.append(
-#             AgentHandoff(
-#                 from_agent=from_agent,
-#                 to_agent=to_agent,
-#                 stage=stage,
-#                 mention=mention,
-#                 payload=payload,
-#                 summary=summary,
-#             )
-#         )
-
-#     def _next_agent_metadata(self, stage: Stage) -> tuple[str, str]:
-#         if stage == Stage.VALIDATE:
-#             return "Validation Swarm", "@validation-swarm"
-#         agent = self.agents[stage]
-#         return agent.name, agent.mention
-
-#     def _event(
-#         self,
-#         state: IncidentState,
-#         stage: Stage,
-#         agent: str,
-#         status: str,
-#         payload: dict[str, Any] | None = None,
-#         error: str | None = None,
-#     ) -> AgentEvent:
-#         event = AgentEvent(
-#             run_id=state.run_id,
-#             stage=stage,
-#             agent=agent,
-#             status=status,  # type: ignore[arg-type]
-#             payload=payload or {},
-#             error=error,
-#         )
-#         state.events.append(event)
-#         return event
-
-#     def _stage_payload(self, state: IncidentState) -> dict[str, Any]:
-#         return {
-#             "context": state.context.model_dump(mode="json") if state.context else None,
-#             "repro": state.repro.model_dump(mode="json") if state.repro else None,
-#             "repro_execution": (
-#                 state.repro_execution.model_dump(mode="json") if state.repro_execution else None
-#             ),
-#             "tests": state.tests.model_dump(mode="json") if state.tests else None,
-#             "candidate_patches": (
-#                 state.candidate_patches.model_dump(mode="json") if state.candidate_patches else None
-#             ),
-#             "fix": state.fix.model_dump(mode="json") if state.fix else None,
-#             "validation": state.validation.model_dump(mode="json") if state.validation else None,
-#             "errors": state.errors,
-#         }
-
-#     def _output_payload(
-#         self,
-#         state: IncidentState,
-#         stage: Stage,
-#         output: BaseModel,
-#     ) -> dict[str, Any]:
-#         payload = output.model_dump(mode="json")
-#         if stage == Stage.REPRO and state.repro_execution:
-#             payload["repro_execution"] = state.repro_execution.model_dump(mode="json")
-#         return payload
+def _pipeline_agents() -> list[dict[str, str]]:
+    return [
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.TRIAGE],
+            "mention": agent_mention(Stage.TRIAGE),
+            "stage": Stage.TRIAGE.value,
+            "kind": "band",
+        },
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.REPRO],
+            "mention": agent_mention(Stage.REPRO),
+            "stage": Stage.REPRO.value,
+            "kind": "band",
+        },
+        {
+            "name": "Repro Sandbox",
+            "mention": "@repro-sandbox",
+            "stage": Stage.REPRO.value,
+            "kind": "infrastructure",
+        },
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.TEST],
+            "mention": agent_mention(Stage.TEST),
+            "stage": Stage.TEST.value,
+            "kind": "band",
+        },
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.FIX],
+            "mention": agent_mention(Stage.FIX),
+            "stage": Stage.FIX.value,
+            "kind": "band",
+        },
+        {
+            "name": "Validation Swarm",
+            "mention": "@validation-swarm",
+            "stage": Stage.VALIDATE.value,
+            "kind": "infrastructure",
+        },
+        {
+            "name": AGENT_DISPLAY_NAMES[Stage.RCA],
+            "mention": agent_mention(Stage.RCA),
+            "stage": Stage.RCA.value,
+            "kind": "band",
+        },
+        {
+            "name": "Orchestrator",
+            "mention": "@orchestrator",
+            "stage": "orchestrator",
+            "kind": "infrastructure",
+        },
+    ]
 
 
 class IncidentOrchestrator:
@@ -862,13 +1051,9 @@ class IncidentOrchestrator:
 
             if state.steps_run >= state.max_steps:
                 state.current_stage = Stage.FAILED
-                yield self._event(
-                    state,
-                    Stage.FAILED,
-                    "orchestrator",
-                    "failed",
-                    error="max_steps exceeded",
-                )
+                state.errors.append("max_steps exceeded")
+                async for event in self._finalize_run(state, alert):
+                    yield event
                 return
 
             if state.current_stage == Stage.VALIDATE:
@@ -879,10 +1064,17 @@ class IncidentOrchestrator:
             agent = self.agents[state.current_stage]
             yield self._event(state, agent.stage, agent.name, "active", self._stage_payload(state))
 
-            output = await agent.run(state, self.llm)
-            self._merge_output(state, agent.stage, output)
+            # FIX stage: use Docker-verified file-rewrite approach instead of raw diff generation
+            if agent.stage == Stage.FIX:
+                output = await _build_verified_patches(state, self.llm)
+                state.candidate_patches = output
+            else:
+                output = await agent.run(state, self.llm)
+                self._merge_output(state, agent.stage, output)
+
 
             if agent.stage == Stage.REPRO:
+                repro_config = DockerSandboxConfig.from_alert(state.raw_alert.payload)
                 self._add_handoff(
                     state,
                     from_agent=agent.name,
@@ -899,7 +1091,9 @@ class IncidentOrchestrator:
                     "handoff",
                     {
                         "mention": "@repro-sandbox",
+                        "from_agent": agent.name,
                         "to_agent": "Repro Sandbox",
+                        "summary": "Repro plan handed to Docker sandbox for Pass 1 execution.",
                         "payload": output.model_dump(mode="json"),
                     },
                 )
@@ -908,19 +1102,29 @@ class IncidentOrchestrator:
                     Stage.REPRO,
                     "Repro Sandbox",
                     "active",
-                    {"timeout_seconds": DEFAULT_CONTAINER_TIMEOUT_SECONDS},
+                    {"timeout_seconds": repro_config.timeout_seconds},
                 )
                 state.repro_execution = await run_repro_pass1(
                     state,
                     output,  # type: ignore[arg-type]
                 )
+                repro_status = "complete"
+                if state.repro_execution.error:
+                    repro_status = "failed"
+                    state.errors.append(f"repro: {state.repro_execution.error}")
+                    state.current_stage = Stage.FAILED
                 yield self._event(
                     state,
                     Stage.REPRO,
                     "Repro Sandbox",
-                    "complete",
+                    repro_status,  # type: ignore[arg-type]
                     state.repro_execution.model_dump(mode="json"),
+                    error=state.repro_execution.error,
                 )
+                if state.current_stage == Stage.FAILED:
+                    async for event in self._finalize_run(state, alert):
+                        yield event
+                    return
 
             state.steps_run += 1
             next_stage = self.transitions[agent.stage]
@@ -940,25 +1144,65 @@ class IncidentOrchestrator:
                     "handoff",
                     {
                         "mention": next_mention,
+                        "from_agent": agent.name,
                         "to_agent": next_agent_name,
+                        "summary": (
+                            f"{agent.name} handed structured incident state to {next_agent_name}."
+                        ),
                         "payload": self._stage_payload(state),
                     },
                 )
 
             state.current_stage = next_stage
 
-        # ── NEW: push fix as a GitHub PR once RCA is complete ─────────────────
+        async for event in self._finalize_run(state, alert):
+            yield event
+
+    async def _finalize_run(
+        self,
+        state: IncidentState,
+        alert: dict[str, Any],
+    ) -> AsyncIterator[AgentEvent]:
+        if state.current_stage == Stage.FAILED:
+            if state.fix and not state.fix_export:
+                state.fix_export = await asyncio.to_thread(export_validated_fix, state)
+            yield self._event(
+                state,
+                Stage.FAILED,
+                "orchestrator",
+                "failed",
+                {
+                    "errors": state.errors,
+                    "repo_full_name": state.repo_full_name,
+                    "repo_path": state.repo_path,
+                    "fix": state.fix.model_dump(mode="json") if state.fix else None,
+                    "fix_export": state.fix_export,
+                    "tests": state.tests.model_dump(mode="json") if state.tests else None,
+                    "rca": state.rca.model_dump(mode="json") if state.rca else None,
+                },
+                error="; ".join(state.errors) if state.errors else "pipeline failed",
+            )
+            return
+
+        if state.fix:
+            state.fix_export = await asyncio.to_thread(export_validated_fix, state)
+
         pr_url: str | None = None
         pr_error: str | None = None
+        auto_pr = bool(alert.get("auto_pr"))
 
-        if state.rca and getattr(state.rca, "patch_unified_diff", None):
+        if auto_pr and state.rca and state.rca.patch_unified_diff and state.fix:
             try:
                 from backend.git_output import push_fix_as_pr
                 # Use the consistently set repo_path from the state
                 pr_url = await push_fix_as_pr(state=state, repo_path=state.repo_path)
             except Exception as exc:
                 pr_error = str(exc)
-        # ── END NEW ───────────────────────────────────────────────────────────
+                state.errors.append(f"pr: {exc}")
+        elif state.rca and state.rca.patch_unified_diff and not auto_pr:
+            pr_error = "auto_pr disabled; patch available in RCA only"
+        elif auto_pr and not state.fix:
+            pr_error = "no validated fix to push"
 
         yield self._event(
             state,
@@ -971,11 +1215,33 @@ class IncidentOrchestrator:
                 "validation": (
                     state.validation.model_dump(mode="json") if state.validation else None
                 ),
-                # ── NEW fields ─────────────────────────────────────────────
+                "repo_full_name": state.repo_full_name,
+                "branch": state.rca.git_branch if state.rca else None,
                 "pr_url": pr_url,
                 "pr_error": pr_error,
+                "errors": state.errors,
+                "fix_export": state.fix_export,
             },
         )
+
+    async def _prepare_repository(self, state: IncidentState, alert: dict[str, Any]) -> None:
+        repo_path, repo_error = await ensure_repo_checkout(alert)
+        state.repo_path = repo_path or None
+        state.repo_full_name = alert.get("repo_full_name")
+        if repo_path:
+            alert["repo_path"] = repo_path
+        if repo_error:
+            state.errors.append(f"repo: {repo_error}")
+            if alert.get("repo_url"):
+                state.current_stage = Stage.FAILED
+            return
+        try:
+            resolved = resolve_safe_repo_path(repo_path)
+            state.repo_files = await asyncio.to_thread(load_repo_files, resolved)
+            enrich_alert_docker_from_repo(alert, resolved)
+            state.raw_alert.payload.update(docker_fields_from_alert(alert))
+        except Exception as exc:
+            state.errors.append(f"repo_files: {exc}")
 
     async def _run_validation_stage(self, state: IncidentState) -> AsyncIterator[AgentEvent]:
         yield self._event(
@@ -987,6 +1253,7 @@ class IncidentOrchestrator:
         )
         if state.candidate_patches is None or state.tests is None:
             state.current_stage = Stage.FAILED
+            state.errors.append("validation: missing candidate patches or regression tests")
             yield self._event(
                 state,
                 Stage.FAILED,
@@ -996,12 +1263,28 @@ class IncidentOrchestrator:
             )
             return
 
+        if not state.candidate_patches.candidates:
+            state.current_stage = Stage.FAILED
+            state.errors.append(
+                "validation: no candidate patches to validate — enable LIVE_LLM_ENABLED "
+                "for real GitHub repositories"
+            )
+            yield self._event(
+                state,
+                Stage.FAILED,
+                "Validation Swarm",
+                "failed",
+                error="no candidate patches to validate",
+            )
+            return
+
         state.validation = await run_validation_swarm(state, state.candidate_patches, state.tests)
         state.fix = state.validation.winning_patch
         state.steps_run += 1
 
         if state.fix is None:
             state.current_stage = Stage.FAILED
+            state.errors.append("validation: no candidate patch passed validation")
             yield self._event(
                 state,
                 Stage.FAILED,
@@ -1034,7 +1317,9 @@ class IncidentOrchestrator:
             "handoff",
             {
                 "mention": next_mention,
+                "from_agent": "Validation Swarm",
                 "to_agent": next_agent_name,
+                "summary": f"Validation Swarm handed validated fix to {next_agent_name}.",
                 "payload": self._stage_payload(state),
             },
         )
@@ -1161,14 +1446,26 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="gpt-4o-mini",
             output_model=IncidentContext,
             system_prompt=(
-                 "You are an on-call incident triager. You receive raw webhook payloads from alerting "
-        "systems like PagerDuty, Datadog, or Sentry. "
-        "Extract a structured incident context with: service name, environment, severity, "
-        "error type, error message, stack trace if present, and estimated user impact. "
-        "Be precise — downstream agents depend entirely on what you extract. "
-        "If a field is missing from the payload, infer it from context or mark it null. "
-        "Never hallucinate stack traces or error messages. "
-        "Return JSON only matching the IncidentContext schema."
+                "You are an expert on-call incident triager at a high-traffic engineering team.\n\n"
+                "STEP 1 — UNDERSTAND THE USER (most important step):\n"
+                "The 'error' field is a free-text description written by a non-technical user who may not know "
+                "how to articulate a software bug clearly. Your first job is to decode their INTENT. "
+                "Ask yourself: 'What is this person frustrated about? What behavior did they expect vs. what do they see?' "
+                "Use the repository source files provided to verify which components match that description.\n\n"
+                "STEP 2 — CLASSIFY:\n"
+                "Your ONLY output is a valid JSON object matching the IncidentContext schema — nothing else.\n"
+                "1. service: use the leaf service name, not the org/repo path (e.g. 'checkout', not 'acme/checkout').\n"
+                "2. environment: must be one of production, staging, ci, demo, or unknown.\n"
+                "3. severity: classify as sev1 (complete outage), sev2 (partial degradation), sev3 (minor), or sev4 (cosmetic).\n"
+                "4. error_signature: a short unique identifier for the error class (e.g. 'missing-test-credentials-on-login-ui').\n"
+                "5. impact: one sentence describing the customer-facing effect.\n"
+                "6. suspected_components: search the repo_files for the UI component or function that would need to change. "
+                "   List the EXACT file paths that exist in the repository (not guessed paths).\n"
+                "7. evidence: list 3-5 key facts from the user description and repo files that support your analysis.\n"
+                "8. interpretations: list 2-3 different perspectives on what the user could mean — consider both UI and data/config interpretations.\n"
+                "9. investigation_plan: a step-by-step plan for the Patch Generator agent to fix the code without hallucinating paths.\n"
+                "10. NEVER invent stack traces, error messages, or file paths not present in the repo_files.\n"
+                "11. If a field cannot be determined, use null — never guess."
             ),
             fallback=_fallback_triage,
         ),
@@ -1176,19 +1473,25 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.REPRO],
             mention=agent_mention(Stage.REPRO),
             stage=Stage.REPRO,
-            provider=Provider.AIML,
+            provider=Provider.FEATHERLESS,
             model_env="REPRO_MODEL",
-            default_model="gpt-4o",
+            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
             output_model=ReproPlan,
             system_prompt=(
-                 "You are a senior SRE planning a local Docker reproduction of a production incident. "
-        "You receive a structured IncidentContext. Your job is to produce a deterministic repro plan: "
-        "the exact command that should fail, what exit code or exception to expect, "
-        "which files or endpoints are involved, and any environment variables needed. "
-        "Assume the repo is mounted at /workspace inside a python:3.11-slim container. "
-        "The repro command must be a single shell command that reproduces the failure reliably. "
-        "Do not guess — if you cannot determine the repro command from context, say so explicitly. "
-        "Return JSON only matching the ReproPlan schema."
+                "You are a senior SRE designing a deterministic Docker reproduction of a production incident. "
+                "You receive a structured IncidentContext and a snapshot of the repository source files. "
+                "Your ONLY output is a valid JSON object matching the ReproPlan schema — nothing else. "
+                "Rules: "
+                "1. repro_command: a single shell command that reliably triggers the reported failure. "
+                "   It must be runnable inside the Docker container at /workspace with no external network calls. "
+                "   Prefer: 'python -c \"from <module> import <fn>; <fn>(<bad_input>)\"' for Python. "
+                "2. expected_exit_code: the exit code the repro command will produce (usually 1 for exceptions). "
+                "3. expected_failure: the exact exception type and message you expect (e.g. 'TypeError: ...'). "
+                "4. steps: list 3-6 ordered English sentences describing what happens during repro. "
+                "5. files_involved: list only the source files directly implicated by the stack trace. "
+                "6. environment_vars: list any env vars the repro command needs (usually empty for unit-level repros). "
+                "7. If you cannot determine the repro command with confidence, set repro_command to 'echo CANNOT_REPRO' "
+                "   and explain in steps why the information is insufficient."
             ),
             fallback=_fallback_repro,
         ),
@@ -1196,20 +1499,36 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.TEST],
             mention=agent_mention(Stage.TEST),
             stage=Stage.TEST,
-            provider=Provider.AIML,
+            provider=Provider.FEATHERLESS,
             model_env="REGRESSION_TEST_MODEL",
-            default_model="gpt-4o",
+            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
             output_model=RegressionTests,
             system_prompt=(
-                "You are a test engineer writing a regression test to permanently catch a production bug. "
-        "You receive Pass 1 Docker execution logs including stdout, stderr, and stack traces. "
-        "Write exactly one pytest test function that: "
-        "directly targets the failing code path shown in the logs, "
-        "asserts the correct behavior (not the buggy behavior), "
-        "will fail on the current buggy code and pass only after a correct fix is applied. "
-        "The test must be strict — no broad exception catches, no assertTrue(True). "
-        "Import only from the standard library or packages already in the repo. "
-        "Return JSON only matching the RegressionTests schema."
+                "You are an expert Test Automation Architect. Your task is to write robust, self-discovering regression tests.\n"
+                "1. ANALYZE MODULES: Before writing tests, inspect the `repo_files` to determine the module structure. "
+                "   Use `PYTHONPATH=.` to ensure the root directory is importable.\n"
+                "2. DYNAMIC DISCOVERY: Do not hardcode tests for specific functions if the module exposes multiple entry points. "
+                "   If you need to verify variable states, explicitly import them from the target module.\n"
+                "3. STDOUT CAPTURE: To test print() output in Python, you MUST pass `capsys` as a parameter to the test function. "
+                "   CORRECT PATTERN:\n"
+                "   def test_func(capsys):\n"
+                "       func_to_test()\n"
+                "       captured = capsys.readouterr()\n"
+                "       assert 'expected' in captured.out\n"
+                "   NEVER use `pytest.capture` or `pytest.capture.capsys()`. These do not exist.\n"
+                "4. GENERIC IMPORTING: When importing, generate the import path based on the directory structure. "
+                "   If file is at `level_1_syntax/app.py`, import via `from level_1_syntax.app import ...`.\n"
+                "5. ROBUSTNESS: Ensure tests handle the `SyntaxError` case by checking if the module can be imported. "
+                "6. FINAL VALIDATION: Before outputting JSON, perform a mental check: "
+                "   a) Is `capsys` in the function parentheses? (Must be: def test_func(capsys):). "
+                "   b) Did I import every variable/function used? (e.g., 'from module import variable'). "
+                "   c) Is the module path correct relative to root? (PYTHONPATH=. makes the root the base)."
+                "7. run_command: the exact single shell command that runs the test (e.g. 'pip install pytest && PYTHONPATH=. pytest tests/test_regression.py')."
+                "8. CONTEXT-AWARE TESTING: ONLY write tests for files and functions that actually exist in the `repo_files` provided. "
+                "   - Do NOT assume a database exists. "
+                "   - Do NOT assume filesystem paths like '/app/uploads/' exist. "
+                "   - If a module (like level_4_security) is not in `repo_files`, do NOT import or test it. "
+                "   - Focus ONLY on testing the code that is actually present in the provided directory."
             ),
             fallback=_fallback_tests,
         ),
@@ -1235,22 +1554,32 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.RCA],
             mention=agent_mention(Stage.RCA),
             stage=Stage.RCA,
-            provider=Provider.AIML,
+            provider=Provider.OPENROUTER,
             model_env="RCA_MODEL",
-            default_model="gpt-4o",
+            default_model="openai/gpt-oss-120b:free",
             output_model=RCAReport,
             system_prompt=(
-                 "You are an SRE writing a formal root cause analysis and preparing a Git commit. "
-        "You receive the winning patch, validation logs confirming it passes, "
-        "and the full incident context from triage. "
-        "Produce: a concise RCA summary (what broke, why, how it was caught), "
-        "a git branch name in the format incident/<service>-<short-slug>, "
-        "a conventional commit message (fix: <what was fixed>), "
-        "the winning unified diff, "
-        "and a one-paragraph validation summary stating which candidate won and why. "
-        "Write for an audience of engineers and engineering managers. "
-        "Be factual — only reference what appears in the logs and patch. "
-        "Return JSON only matching the RCAReport schema."
+                "You are an SRE writing a simple, formal, publishable root cause analysis report summary. "
+                "You receive the winning patch, validation evidence, and the full incident context. "
+                "Keep the final summary simple and easy to read for the end user. "
+                "Your ONLY output is a valid JSON object matching the RCAReport schema — nothing else. "
+                "Rules: "
+                "1. title: a concise incident title (e.g. 'Checkout service crashes on null payload'). "
+                "2. incident_summary: 2-3 sentences covering: what failed, when it was detected, who was impacted. "
+                "3. customer_impact: one sentence on the end-user effect (e.g. '100% of checkout requests failed'). "
+                "4. root_cause: the precise technical cause (e.g. 'handle() passes payload directly to process() "
+                "   without a None guard; passing None raises TypeError on payload[\"order_id\"]'). "
+                "5. timeline: list at least 5 events in chronological order as plain-English strings "
+                "   (e.g. '2024-01-15 14:32 UTC — Alert fired: checkout service returning 500'). "
+                "   Include: alert fired, triage complete, repro confirmed, fix generated, validation passed, RCA published. "
+                "6. contributing_factors: list 2-4 factors that allowed this bug to reach production. "
+                "7. prevention_recommendations: list 3-5 actionable items to prevent recurrence. "
+                "8. git_branch: branch name in format 'fix/<service>-<slug>' (e.g. 'fix/checkout-null-payload'). "
+                "9. commit_message: conventional commit format: 'fix(<scope>): <what was fixed>' (max 72 chars). "
+                "10. patch_unified_diff: copy the winning patch diff verbatim. "
+                "11. validation_summary: one paragraph: which candidate won, what the test verified, exit code. "
+                "12. final_markdown: a complete markdown RCA report (use ## headings for each section above). "
+                "Be factual — only reference what appears in the logs, patch, and context. Never invent details."
             ),
             fallback=_fallback_rca,
         ),
@@ -1262,19 +1591,35 @@ def _alert_value(state: IncidentState, key: str, default: str) -> str:
     return value if isinstance(value, str) else json.dumps(value)
 
 
+def _service_label(state: IncidentState) -> str:
+    alert = state.raw_alert.payload
+    short = alert.get("service_short")
+    if isinstance(short, str) and short.strip():
+        return short.strip()
+    return _alert_value(state, "service", "unknown-service")
+
+
 def _fallback_triage(state: IncidentState) -> IncidentContext:
+    service = _service_label(state)
+    severity_raw = _alert_value(state, "severity", "sev2").lower()
+    try:
+        severity = Severity(severity_raw)
+    except ValueError:
+        severity = Severity.SEV2
     return IncidentContext(
-        service=_alert_value(state, "service", "unknown-service"),
+        service=service,
         environment=_alert_value(state, "environment", "unknown"),
         error_signature=_alert_value(
             state,
             "error",
             _alert_value(state, "message", "unknown-error"),
         ),
-        severity=Severity.SEV2,
+        severity=severity,
         impact=_alert_value(state, "impact", "impact requires manual confirmation"),
-        suspected_components=[_alert_value(state, "service", "unknown-service")],
+        suspected_components=[service],
         evidence=[json.dumps(state.raw_alert.payload, separators=(",", ":"))],
+        interpretations=["Fallback: deep analysis required by human"],
+        investigation_plan=["Fallback: require human intervention"],
     )
 
 
@@ -1294,6 +1639,43 @@ def _fallback_repro(state: IncidentState) -> ReproPlan:
     )
 
 
+def _demo_handler_rel_path(state: IncidentState) -> str | None:
+    service = _service_label(state)
+    slug = service.lower().replace("-", "_")
+    candidates = [
+        "services/checkout/handler.py",
+        f"services/{service}/handler.py",
+        f"services/{slug}/handler.py",
+    ]
+    seen: set[str] = set()
+    for path in candidates:
+        if path in seen:
+            continue
+        seen.add(path)
+        if path in state.repo_files:
+            return path
+        if state.repo_path:
+            if (Path(state.repo_path) / path).is_file():
+                return path
+    return None
+
+
+def _placeholder_patch(index: int) -> CodePatch:
+    return CodePatch(
+        summary=f"Candidate {index + 1}: LLM required for repository-specific fix.",
+        files_changed=[],
+        patch_unified_diff=(
+            f"--- a/placeholder_{index}.txt\n"
+            f"+++ b/placeholder_{index}.txt\n"
+            f"@@ -1 +1 @@\n"
+            f"-before\n"
+            f"+after{index}\n"
+        ),
+        risk_notes=["Generated because LIVE_LLM_ENABLED=false and no demo handler exists."],
+        rollback_plan="No changes applied.",
+    )
+
+
 def _fallback_fix(state: IncidentState) -> CandidatePatches:
     # Repo-aware requirement: if we don't have repo context, never generate placeholder diffs.
     # This prevents committing hallucinated patches such as services/unknown-service/...
@@ -1303,18 +1685,20 @@ def _fallback_fix(state: IncidentState) -> CandidatePatches:
 
 
 
-def _fallback_patch_diff(service: str, index: int) -> str:
-    guard_message = [
+def _fallback_patch_diff(handler_path: str, index: int) -> str:
+    _guard_messages = [
         "payload is required",
         "payload cannot be empty",
         "missing payload",
         "invalid payload",
         "payload validation failed",
-    ][index]
+    ]
+    guard_message = _guard_messages[index % len(_guard_messages)]
+    path = handler_path
     return (
-        f"--- a/services/{service}/handler.py\n"
-        f"+++ b/services/{service}/handler.py\n"
-        "@@\n"
+        f"--- a/{path}\n"
+        f"+++ b/{path}\n"
+        "@@ -8,1 +8,3 @@\n"
         "-    result = process(payload)\n"
         "+    if payload is None:\n"
         f"+        raise ValueError('{guard_message}')\n"

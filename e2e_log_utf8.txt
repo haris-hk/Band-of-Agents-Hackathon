@@ -1,0 +1,25 @@
+﻿EVENT: queued     | orchestrator              | triage
+EVENT: active     | Alert Triager             | triage
+EVENT: complete   | Alert Triager             | triage
+EVENT: handoff    | Alert Triager             | repro
+EVENT: active     | Incident Reproducer       | repro
+EVENT: handoff    | Incident Reproducer       | repro
+EVENT: active     | Repro Sandbox             | repro
+EVENT: complete   | Repro Sandbox             | repro
+EVENT: complete   | Incident Reproducer       | repro
+EVENT: handoff    | Incident Reproducer       | test
+EVENT: active     | Regression Test Generator | test
+EVENT: complete   | Regression Test Generator | test
+EVENT: handoff    | Regression Test Generator | fix
+EVENT: active     | Patch Generator           | fix
+EVENT: complete   | Patch Generator           | fix
+EVENT: handoff    | Patch Generator           | validate
+EVENT: active     | Validation Swarm          | validate
+EVENT: failed     | Validation Swarm          | failed
+
+=== SUMMARY ===
+Total events: 18
+Has queued: True
+Has handoff: True
+Terminal: failed @ failed
+Error: no candidate patch passed validation

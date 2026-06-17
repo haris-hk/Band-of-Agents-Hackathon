@@ -5,10 +5,12 @@
   "impact": "Checkout requests with malformed payloads return 500 instead of a controlled validation error.",
   "repo_path": ".",
   "docker_image": "python:3.11-slim",
-  "setup_command": "python -m pip install pytest",
+  "setup_command": "python -m pip install -q pytest && (command -v patch >/dev/null || (apt-get update -qq && apt-get install -y -qq patch))",
   "repro_command": "python -c \"from services.checkout.handler import handle; handle(None)\"",
   "validation_command": "python -m pytest tests/checkout/test_incident_regression.py",
-  "container_timeout_seconds": 60,
+  "container_timeout_seconds": 180,
   "patch_strip": 1,
-  "docker_network_disabled": false
+  "docker_network_disabled": false,
+  "auto_pr": false,
+  "source": "demo"
 }
