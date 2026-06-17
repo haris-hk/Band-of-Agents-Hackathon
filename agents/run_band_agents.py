@@ -36,7 +36,7 @@ def create_band_agents() -> list[Agent]:
     load_project_env()
     stage_agents = build_agents()
     shared_llm = InferenceClients()
-    order = [Stage.TRIAGE, Stage.REPRO, Stage.TEST, Stage.FIX, Stage.RCA]
+    order = [Stage.TRIAGE, Stage.REPRO, Stage.TEST, Stage.FIX, Stage.VALIDATE, Stage.RCA]
     agents: list[Agent] = []
 
     for stage in order:
