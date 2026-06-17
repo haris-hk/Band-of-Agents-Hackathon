@@ -16,4 +16,4 @@ AGENT_CONFIG_PATH = PROJECT_ROOT / "agent_config.yaml"
 
 
 def load_project_env() -> bool:
-    return load_dotenv(dotenv_path=ENV_PATH, override=False)
+    return load_dotenv(dotenv_path=ENV_PATH, override=True)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timezone
 try:
     from enum import StrEnum
 except ImportError:  # pragma: no cover - compatibility for local Python 3.9 runners.
@@ -12,6 +12,11 @@ from typing import Any, Literal
 from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, model_validator
+
+
+def _utcnow() -> datetime:
+    """Timezone-aware UTC timestamp (replaces deprecated datetime.utcnow)."""
+    return datetime.now(timezone.utc)
 
 
 class Stage(StrEnum):
@@ -35,12 +40,13 @@ class Severity(StrEnum):
 class Provider(StrEnum):
     AIML = "aimlapi"
     FEATHERLESS = "featherless"
+    OPENROUTER = "openrouter"
 
 
 class RawAlert(BaseModel):
     source: str = "simulated-webhook"
     payload: dict[str, Any]
-    received_at: datetime = Field(default_factory=datetime.utcnow)
+    received_at: datetime = Field(default_factory=_utcnow)
 
 
 class IncidentContext(BaseModel):
@@ -51,6 +57,8 @@ class IncidentContext(BaseModel):
     impact: str
     suspected_components: list[str] = Field(default_factory=list)
     evidence: list[str] = Field(default_factory=list)
+    interpretations: list[str] = Field(default_factory=list, description="Different possible interpretations of what the user is trying to say or what the root cause could be based on the repo context.")
+    investigation_plan: list[str] = Field(default_factory=list, description="Step-by-step plan for how the agents should investigate and fix the problem.")
 
 
 class ReproPlan(BaseModel):
@@ -93,7 +101,7 @@ class CandidatePatches(BaseModel):
 
 class RegressionTests(BaseModel):
     framework: str = "pytest"
-    test_files: list[str] = Field(default_factory=list, max_length=1)
+    test_files: list[str] = Field(default_factory=list)
     test_code: str
     run_command: str = "pytest"
     acceptance_criteria: list[str] = Field(default_factory=list)
@@ -138,7 +146,7 @@ class AgentHandoff(BaseModel):
     payload: dict[str, Any]
     message_type: str = "band.handoff.v1"
     summary: str | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class AgentEvent(BaseModel):
@@ -148,13 +156,13 @@ class AgentEvent(BaseModel):
     status: Literal["queued", "active", "handoff", "complete", "failed", "done"]
     payload: dict[str, Any] = Field(default_factory=dict)
     error: str | None = None
-    created_at: datetime = Field(default_factory=datetime.utcnow)
+    created_at: datetime = Field(default_factory=_utcnow)
 
 
 class IncidentState(BaseModel):
     run_id: UUID = Field(default_factory=uuid4)
     current_stage: Stage = Stage.TRIAGE
-    max_steps: int = 6
+    max_steps: int = 8
     steps_run: int = 0
     raw_alert: RawAlert
     context: IncidentContext | None = None
@@ -170,6 +178,8 @@ class IncidentState(BaseModel):
     errors: list[str] = Field(default_factory=list)
     repo_path: str | None = None
     repo_full_name: str | None = None
+    repo_files: dict[str, str] = Field(default_factory=dict)
+    fix_export: dict[str, Any] | None = None
 
 
 class RunRequest(BaseModel):
