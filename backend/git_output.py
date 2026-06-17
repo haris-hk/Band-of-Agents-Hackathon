@@ -113,16 +113,18 @@ def _push_fix_as_pr_sync(state: IncidentState, repo_path: str) -> str:
     except RuntimeError:
         _run_cmd(["git", "checkout", branch_name], cwd=repo_path)
 
+    # ADDED newline="" to stop Windows from corrupting the patch file
     with tempfile.NamedTemporaryFile(
-        mode="w", suffix=".patch", delete=False, encoding="utf-8"
+        mode="w", suffix=".patch", delete=False, encoding="utf-8", newline=""
     ) as handle:
         handle.write(patch_diff)
         patch_file = handle.name
     # File must be closed before _run_cmd opens it (required on Windows).
 
     try:
+        # ADDED --ignore-space-change to make git apply bulletproof across platforms
         _run_cmd(
-            ["git", "apply", "-p1", "--ignore-whitespace", patch_file],
+            ["git", "apply", "-p1", "--ignore-space-change", "--whitespace=nowarn", patch_file],
             cwd=repo_path,
         )
     finally:
