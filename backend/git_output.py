@@ -122,11 +122,15 @@ def _push_fix_as_pr_sync(state: IncidentState, repo_path: str) -> str:
     # File must be closed before _run_cmd opens it (required on Windows).
 
     try:
-        # ADDED --ignore-space-change to make git apply bulletproof across platforms
-        _run_cmd(
-            ["git", "apply", "-p1", "--ignore-space-change", "--whitespace=nowarn", patch_file],
-            cwd=repo_path,
-        )
+        # Check if fix_export.py already applied the changes to the files
+        already_applied = state.fix_export and state.fix_export.get("applied_to_repo")
+        
+        # Only apply the patch if it hasn't been applied yet!
+        if not already_applied:
+            _run_cmd(
+                ["git", "apply", "-p1", "--ignore-space-change", "--whitespace=nowarn", patch_file],
+                cwd=repo_path,
+            )
     finally:
         try:
             os.unlink(patch_file)
