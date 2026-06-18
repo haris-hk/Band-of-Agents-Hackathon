@@ -41,6 +41,7 @@ class Provider(StrEnum):
     AIML = "aimlapi"
     FEATHERLESS = "featherless"
     OPENROUTER = "openrouter"
+    OLLAMA = "ollama"
 
 
 class RawAlert(BaseModel):

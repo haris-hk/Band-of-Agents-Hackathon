@@ -1461,7 +1461,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             stage=Stage.TRIAGE,
             provider=Provider.AIML,
             model_env="TRIAGE_MODEL",
-            default_model="gpt-4o-mini",
+            default_model="batiai/qwen3.6-27b:iq4",
             output_model=IncidentContext,
             system_prompt=(
                 "You are an expert on-call incident triager at a high-traffic engineering team.\n\n"
@@ -1491,9 +1491,9 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.REPRO],
             mention=agent_mention(Stage.REPRO),
             stage=Stage.REPRO,
-            provider=Provider.FEATHERLESS,
+            provider=Provider.AIML,
             model_env="REPRO_MODEL",
-            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
+            default_model="alibaba/qwen3.6-35b-a3b",
             output_model=ReproPlan,
             system_prompt=(
                 "You are a senior SRE designing a deterministic Docker reproduction of a production incident. "
@@ -1517,9 +1517,9 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.TEST],
             mention=agent_mention(Stage.TEST),
             stage=Stage.TEST,
-            provider=Provider.FEATHERLESS,
+            provider=Provider.AIML,
             model_env="REGRESSION_TEST_MODEL",
-            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
+            default_model="alibaba/qwen3.6-35b-a3b",
             output_model=RegressionTests,
             system_prompt=(
                 "You are an expert Test Automation Architect. Your task is to write robust, self-discovering regression tests.\n"
@@ -1554,9 +1554,9 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.FIX],
             mention=agent_mention(Stage.FIX),
             stage=Stage.FIX,
-            provider=Provider.FEATHERLESS,
+            provider=Provider.AIML,
             model_env="PATCH_GENERATOR_MODEL",
-            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
+            default_model="alibaba/qwen3.6-35b-a3b",
             output_model=CandidatePatches,
             system_prompt=(
                 "You are an expert software engineer generating patches for a production incident. "
@@ -1572,9 +1572,9 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.RCA],
             mention=agent_mention(Stage.RCA),
             stage=Stage.RCA,
-            provider=Provider.OPENROUTER,
+            provider=Provider.AIML,
             model_env="RCA_MODEL",
-            default_model="openai/gpt-oss-120b:free",
+            default_model="alibaba/qwen3.6-35b-a3b",
             output_model=RCAReport,
             system_prompt=(
                 "You are an SRE writing a simple, formal, publishable root cause analysis report summary. "
@@ -1611,9 +1611,9 @@ def build_agents() -> dict[Stage, IncidentAgent]:
     name=AGENT_DISPLAY_NAMES[Stage.VALIDATE],
     mention=agent_mention(Stage.VALIDATE),
     stage=Stage.VALIDATE,
-    provider=Provider.FEATHERLESS,
+    provider=Provider.AIML,
     model_env="VALIDATION_MODEL",
-    default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
+    default_model="alibaba/qwen3.6-35b-a3b",
     output_model=ValidationReport,
     system_prompt=(
         "You are a senior QA Engineer responsible for validating candidate patches against a regression test suite.\n\n"
