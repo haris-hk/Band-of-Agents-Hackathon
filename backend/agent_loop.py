@@ -1465,6 +1465,9 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             output_model=IncidentContext,
             system_prompt=(
 <<<<<<< HEAD
+<<<<<<< HEAD
+=======
+>>>>>>> 21bf9a0 (Fixed front end thingy)
                 "You are an expert on-call incident triager at a high-traffic engineering team.\n\n"
                 "STEP 1 — UNDERSTAND THE USER (most important step):\n"
                 "The 'error' field is a free-text description written by a non-technical user who may not know "
@@ -1485,6 +1488,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
                 "9. investigation_plan: a step-by-step plan for the Patch Generator agent to fix the code without hallucinating paths.\n"
                 "10. NEVER invent stack traces, error messages, or file paths not present in the repo_files.\n"
                 "11. If a field cannot be determined, use null — never guess."
+<<<<<<< HEAD
 =======
                 "You are an SRE writing a simple, formal, publishable root cause analysis report summary. "
                 "You receive the winning patch, validation evidence, and the full incident context. "
@@ -1514,6 +1518,8 @@ def build_agents() -> dict[Stage, IncidentAgent]:
                 "12. final_markdown: a complete markdown RCA report (use ## headings for each section above). "
                 "Be factual — only reference what appears in the repro_logs, patch, and context. Never invent details."
 >>>>>>> 4bb168d (update)
+=======
+>>>>>>> 21bf9a0 (Fixed front end thingy)
             ),
             fallback=_fallback_triage,
         ),

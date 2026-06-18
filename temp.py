@@ -4,6 +4,7 @@ import json
 AGENT_KEY = "band_a_1781718378_oGUOGcE1RkdxVP9apFtoOvUiIvU-3NSJ"
 ROOM_ID = "a16e6f9b-0e0b-49a6-8d0b-f3ea2e7fa5ad"
 
+<<<<<<< HEAD
 import os
 
 alert_data = {
@@ -15,6 +16,9 @@ alert_data = {
     "auto_pr": "true",
 
 }
+=======
+alert_data = {"repo_url": "https://github.com/hamzaraza123/mock-buggy-project", "error": "Fix syntax error in level_1_syntax/app.py", "impact": "error", "service_short": "mock-buggy-project", "severity": "sev2", "auto_pr": "true"}
+>>>>>>> 21bf9a0 (Fixed front end thingy)
 
 data = {
     "message": {
