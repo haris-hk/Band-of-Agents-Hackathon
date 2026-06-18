@@ -13,7 +13,7 @@ alert_data = {
     "service_short": "mock-buggy-project",
     "severity": "sev2",
     "auto_pr": "true",
-    "github_token": "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"   # ← your token here
+    "github_token": "xxx"   # ← your token here
 }
 
 data = {
