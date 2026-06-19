@@ -41,6 +41,7 @@ class Provider(StrEnum):
     AIML = "aimlapi"
     FEATHERLESS = "featherless"
     OPENROUTER = "openrouter"
+    OLLAMA = "ollama"
 
 
 class RawAlert(BaseModel):
@@ -181,6 +182,21 @@ class IncidentState(BaseModel):
     repo_files: dict[str, str] = Field(default_factory=dict)
     fix_export: dict[str, Any] | None = None
 
+class PatchResult(BaseModel):
+    patch_id: str
+    applies_cleanly: bool
+    test_exit_code: int
+    test_output_summary: str
+    side_effects: list[str]
+    correctness_score: int  # 0-10
+
+class ValidationReport(BaseModel):
+    patch_results: list[PatchResult]
+    winning_patch_id: str | None
+    confidence: Literal["high", "medium", "low"]
+    validation_notes: str
+    regression_risk: Literal["none", "low", "medium", "high"]
+    suggested_followup_tests: list[str]
 
 class RunRequest(BaseModel):
     alert: dict[str, Any]

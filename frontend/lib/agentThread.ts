@@ -1,11 +1,33 @@
+// Matches the backend AgentEvent schema in backend/schemas.py
+export type AgentEventStatus =
+  | "queued"
+  | "active"
+  | "handoff"
+  | "complete"
+  | "failed"
+  | "done";
+
+export type AgentEventStage =
+  | "triage"
+  | "repro"
+  | "test"
+  | "fix"
+  | "validate"
+  | "rca"
+  | "done"
+  | "failed";
+
 export type AgentEvent = {
+  /** Present on real events; absent on heartbeat pings. */
   type?: string;
+  /** UUID string — always present on real events emitted by the orchestrator. */
   run_id?: string;
-  stage: string;
+  stage: AgentEventStage | string;
   agent: string;
-  status: string;
+  status: AgentEventStatus | string;
   payload: Record<string, unknown>;
   error?: string;
+  /** ISO-8601 datetime string. */
   created_at?: string;
 };
 

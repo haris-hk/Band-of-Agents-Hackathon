@@ -9,7 +9,7 @@ import shlex
 import tarfile
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any, AsyncIterator, Callable
+from typing import Any, AsyncIterator, Callable, Literal 
 
 from backend.agent_context import build_stage_prompt
 from backend.alert_normalize import normalize_alert
@@ -45,6 +45,8 @@ from backend.schemas import (
     Severity,
     Stage,
     ValidationSwarmResult,
+    PatchResult,        
+    ValidationReport,
 )
 
 Fallback = Callable[[IncidentState], BaseModel]
@@ -62,7 +64,7 @@ class FileRewriteCandidates(BaseModel):
     """LLM returns two file-rewrite candidates; we convert them to proper unified diffs."""
     candidates: list[FilePatch]
 
-DEFAULT_CONTAINER_TIMEOUT_SECONDS = 60
+DEFAULT_CONTAINER_TIMEOUT_SECONDS = 300
 MAX_CONTAINER_TIMEOUT_SECONDS = 600
 
 # Skip heavy dirs when copying host repo into containers (especially on Windows bind mounts).
@@ -90,6 +92,31 @@ def truncate_logs(log_string: str, max_lines: int = 200) -> str:
     return "\n".join(log_string.splitlines()[-max_lines:])
 
 
+# 1. Move load_repo_files OUTSIDE the class as a standalone helper
+def load_repo_files(repo_path: str, max_files: int = 20) -> dict:
+    code_map = {}
+    if not os.path.exists(repo_path):
+        return code_map
+
+    for root, _, files in os.walk(repo_path):
+        for f in files:
+            # Add other extensions if needed (e.g., .tsx, .rs, .md)
+            if f.endswith((".py", ".ts", ".js", ".go", ".java")):
+                full_path = os.path.join(root, f)
+                try:
+                    with open(full_path, "r", encoding="utf-8") as file:
+                        # Store by relative path for cleaner LLM context
+                        rel_path = os.path.relpath(full_path, repo_path)
+                        rel_path = rel_path.replace("\\", "/")  # FORCE LINUX PATHS
+                        code_map[rel_path] = file.read()
+                except Exception:
+                    continue
+
+                if len(code_map) >= max_files:
+                    return code_map
+
+    return code_map
+
 @dataclass(frozen=True)
 class IncidentAgent:
     name: str
@@ -103,31 +130,62 @@ class IncidentAgent:
     default_model: str
 
     async def run(self, state: IncidentState, llm: InferenceClients) -> BaseModel:
-        prompt = build_stage_prompt(state, self.stage)
+        # Dump state to dict first
+        state_dict = state.model_dump(mode="json")
+
+        # Resolve repo path (fallback to alert payload if state isn't explicitly set)
+        active_repo_path = state.repo_path or state.raw_alert.payload.get("repo_path")
+
+        print(f"🔍 [DEBUG] IncidentAgent.run() - stage: {self.stage}")
+        print(f"🔍 [DEBUG] active_repo_path: {active_repo_path}")
+        print(f"🔍 [DEBUG] state.repo_path: {state.repo_path}")
+        print(f"🔍 [DEBUG] raw_alert.payload keys: {list(state.raw_alert.payload.keys())}")
+
+       # INJECT REAL CODE: Only for agents that need to see code
+        if active_repo_path and self.stage in {Stage.REPRO, Stage.TEST, Stage.FIX, Stage.VALIDATE}:
+            state_dict["repository_files"] = load_repo_files(active_repo_path)
+            print(f"🔍 [DEBUG] Loaded {len(state_dict.get('repository_files', {}))} files for {self.stage}")
+        else:
+            print(f"🔍 [DEBUG] SKIPPING repo load: active_repo_path={active_repo_path}, stage={self.stage}")
+        # Include exact repro logs for RCA so it can cite specific line numbers and error types
+        if self.stage == Stage.RCA and state.repro_execution:
+            state_dict["repro_logs"] = state.repro_execution.logs
+
+        prompt = json.dumps(state_dict, separators=(",", ":"))
+
         try:
-            return await llm.json_call(
+            output = await llm.json_call(
                 provider=self.provider,
                 model=self.model_name,
                 system=self.system_prompt,
                 user=prompt,
                 output_model=self.output_model,
             )
+            if self.stage == Stage.FIX:
+                print(f"🔍 [DEBUG] Fix agent: LLM call completed, output type: {type(output)}")
+                print(f"🔍 [DEBUG] Fix agent: output: {output}")
+                print(f"🔍 [DEBUG] Fix agent: state.candidate_patches: {state.candidate_patches}")
+            return output
         except GuardrailBlocked:
             return self.fallback(state)
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception as exc:
             state.errors.append(f"{self.name}: {exc}")
+            # Repo-aware safety: never let FIX fall back to placeholder diffs.
+            if self.stage == Stage.FIX:
+                raise
             return self.fallback(state)
+
+
 
     @property
     def model_name(self) -> str:
         return os.getenv(self.model_env) or self.default_model
 
-
 @dataclass(frozen=True)
 class DockerSandboxConfig:
-    image: str = "python:3.11-slim"
+    image: str = "python:3.11"
     repo_path: Path = field(default_factory=lambda: Path.cwd())
     workdir: str = "/workspace"
     source_mount: str = "/workspace_src"
@@ -172,7 +230,7 @@ class DockerSandboxConfig:
             image=_alert_string(
                 alert,
                 ("docker_image", "container_image", "image"),
-                "python:3.11-slim",
+                "python:3.11",
             ),
             repo_path=repo_path.resolve(),
             workdir=_alert_string(alert, ("container_workdir", "workdir"), "/workspace"),
@@ -181,7 +239,7 @@ class DockerSandboxConfig:
             repro_command=_alert_string(
                 alert,
                 ("repro_command", "failing_command"),
-                _alert_string(alert, ("test_command",), "pytest"),
+                _alert_string(alert, ("test_command",), "pip install pytest && pytest"),
             ),
             validation_command=validation_command,
             patch_strip=max(0, _alert_int(alert, ("patch_strip",), 1)),
@@ -268,6 +326,7 @@ class DockerContainerExecutor:
             self._put_text_files("/tmp", {"candidate.patch": patch.patch_unified_diff})
 
             patch_command = (
+                "apt-get update -y && apt-get install -y patch || true; "
                 f"cd {shlex.quote(self.config.workdir)} && "
                 f"patch --batch --forward --fuzz=3 -p{self.config.patch_strip} "
                 "-i /tmp/candidate.patch"
@@ -276,6 +335,7 @@ class DockerContainerExecutor:
             if patch_code != 0:
                 # Retry without fuzz (in case LLM generated exact-context diffs)
                 patch_command2 = (
+                    "apt-get update -y && apt-get install -y patch || true; "
                     f"cd {shlex.quote(self.config.workdir)} && "
                     f"patch --batch --forward -p{self.config.patch_strip} "
                     "-i /tmp/candidate.patch"
@@ -316,6 +376,9 @@ class DockerContainerExecutor:
         await asyncio.to_thread(self._cleanup_sync, True)
 
     def _start_container(self) -> None:
+        print(f"🔍 [DEBUG] Starting Docker container for {self.label}")
+        print(f"🔍 [DEBUG] repo_path: {self.config.repo_path}")
+        print(f"🔍 [DEBUG] image: {self.config.image}")
         if not self.config.repo_path.exists():
             raise FileNotFoundError(f"repo_path does not exist: {self.config.repo_path}")
 
@@ -527,11 +590,12 @@ def _make_unified_diff(file_path: str, original: str, new_content: str) -> str:
     original_lines = original_clean.splitlines(keepends=True)
     new_lines = new_clean.splitlines(keepends=True)
 
+    safe_file_path = file_path.replace("\\", "/") # FIX PATH SEPARATORS
     diff_parts = difflib.unified_diff(
         original_lines,
         new_lines,
-        fromfile=f"a/{file_path}",
-        tofile=f"b/{file_path}",
+        fromfile=f"a/{safe_file_path}",
+        tofile=f"b/{safe_file_path}",
         # No lineterm arg — use default (\n appended to header-only lines)
     )
     result = "".join(diff_parts)
@@ -609,6 +673,7 @@ def _docker_verify_patch(
             container.put_archive("/tmp", buf.read())
 
             patch_cmd = (
+                "apt-get update -y && apt-get install -y patch || true; "
                 "cd /workspace && "
                 "patch --batch --forward --fuzz=3 -p1 -i /tmp/candidate.patch"
             )
@@ -993,33 +1058,34 @@ class IncidentOrchestrator:
         self.agents = build_agents()
 
     async def run(self, alert: dict[str, Any]) -> AsyncIterator[AgentEvent]:
-        alert = normalize_alert(alert)
-        state = IncidentState(raw_alert=RawAlert(payload=alert))
-        await self._prepare_repository(state, alert)
+        print(f"🔍 [DEBUG] Orchestrator.run() called with alert keys: {list(alert.keys())}")
+        print(f"🔍 [DEBUG] repo_url: {alert.get('repo_url')}")
+        print(f"🔍 [DEBUG] repo_path: {alert.get('repo_path')}")
+        # Extract repo context immediately
+        repo_path = alert.get("repo_path", "")
+        # Fallback to service name if full name isn't provided, to prevent crashes
+        repo_full_name = alert.get("repo_full_name") or alert.get("service", "unknown/unknown")
 
-        docker_ok, docker_message = await asyncio.to_thread(check_docker_available)
-
-        yield self._event(
-            state,
-            Stage.TRIAGE,
-            "orchestrator",
-            "queued",
-            {
-                "alert": public_alert(alert),
-                "pipeline": _pipeline_steps(),
-                "agents": _pipeline_agents(),
-                "run_id": str(state.run_id),
-                "docker_available": docker_ok,
-                "docker_message": docker_message,
-            },
+        state = IncidentState(
+            raw_alert=RawAlert(payload=alert),
+            repo_path=repo_path,
+            repo_full_name=repo_full_name,
         )
+        yield self._event(state, Stage.TRIAGE, "orchestrator", "queued", {"alert": alert})
 
+        # ==========================================
+        # ADD THIS BLOCK HERE TO FIX THE CLONE ERROR
+        # ==========================================
+        await self._prepare_repository(state, alert)
+        print(f"🔍 [DEBUG] After _prepare_repository: repo_path={state.repo_path}, repo_files count={len(state.repo_files)}")
         if state.current_stage == Stage.FAILED:
             async for event in self._finalize_run(state, alert):
                 yield event
             return
+        # ==========================================
 
         while state.current_stage not in {Stage.DONE, Stage.FAILED}:
+
             if state.steps_run >= state.max_steps:
                 state.current_stage = Stage.FAILED
                 state.errors.append("max_steps exceeded")
@@ -1126,8 +1192,10 @@ class IncidentOrchestrator:
 
             state.current_stage = next_stage
 
+        print(f"🔍 [DEBUG] Orchestrator.run() completed. Calling _finalize_run...")
         async for event in self._finalize_run(state, alert):
             yield event
+        print(f"🔍 [DEBUG] _finalize_run completed")
 
     async def _finalize_run(
         self,
@@ -1160,12 +1228,20 @@ class IncidentOrchestrator:
 
         pr_url: str | None = None
         pr_error: str | None = None
-        auto_pr = bool(alert.get("auto_pr"))
+        auto_pr_raw = alert.get("auto_pr")
+        print(f"🔍 [DEBUG] auto_pr_raw: {auto_pr_raw}")
+        print(f"🔍 [DEBUG] auto_pr_raw type: {type(auto_pr_raw)}")
+        auto_pr = bool(auto_pr_raw)
+        print(f"🔍 [DEBUG] auto_pr after bool: {auto_pr}")
+        print(f"🔍 [DEBUG] state.repo_path: {state.repo_path}")
+        print(f"🔍 [DEBUG] state.rca: {state.rca is not None}")
+        print(f"🔍 [DEBUG] state.fix: {state.fix is not None}")
 
         if auto_pr and state.rca and state.rca.patch_unified_diff and state.fix:
             try:
-                repo_path = state.repo_path or alert.get("repo_path", "")
-                pr_url = await push_fix_as_pr(state=state, repo_path=repo_path)
+                from backend.git_output import push_fix_as_pr
+                # Use the consistently set repo_path from the state
+                pr_url = await push_fix_as_pr(state=state, repo_path=state.repo_path)
             except Exception as exc:
                 pr_error = str(exc)
                 state.errors.append(f"pr: {exc}")
@@ -1413,7 +1489,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             stage=Stage.TRIAGE,
             provider=Provider.AIML,
             model_env="TRIAGE_MODEL",
-            default_model="gpt-4o-mini",
+            default_model="gpt-4.1-mini",
             output_model=IncidentContext,
             system_prompt=(
                 "You are an expert on-call incident triager at a high-traffic engineering team.\n\n"
@@ -1443,9 +1519,9 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.REPRO],
             mention=agent_mention(Stage.REPRO),
             stage=Stage.REPRO,
-            provider=Provider.FEATHERLESS,
+            provider=Provider.AIML,
             model_env="REPRO_MODEL",
-            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
+            default_model="gpt-4.1-mini",
             output_model=ReproPlan,
             system_prompt=(
                 "You are a senior SRE designing a deterministic Docker reproduction of a production incident. "
@@ -1469,32 +1545,36 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.TEST],
             mention=agent_mention(Stage.TEST),
             stage=Stage.TEST,
-            provider=Provider.FEATHERLESS,
+            provider=Provider.AIML,
             model_env="REGRESSION_TEST_MODEL",
-            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
+            default_model="gpt-4.1-mini",
             output_model=RegressionTests,
             system_prompt=(
-                "You are a senior test engineer writing a regression test to permanently prevent a production bug. "
-                "You receive the repo source files, Docker repro logs, and incident context. "
-                "Your ONLY output is a valid JSON object matching the RegressionTests schema — nothing else. "
-                "CRITICAL — detect the language/stack from the repo_files provided: "
-                "  - If package.json is present: this is a JavaScript/TypeScript/Node.js project. "
-                "    Write a Node.js test using the built-in 'node:assert' module, saved as a .mjs or .test.js file. "
-                "    The run_command must be: 'node <test_file>' (NOT pytest, NOT mocha unless it is already a dependency). "
-                "    The test must: read the actual source file paths shown in repo_files, "
-                "    use fs.readFileSync to check file contents match expected values, OR "
-                "    use dynamic import() to import the module and test it directly. "
-                "  - If setup.py / pyproject.toml / requirements.txt is present: Python project. Use pytest. "
-                "Rules: "
-                "1. test_files: use a real path like 'tests/test_regression.mjs' for JS or 'tests/test_regression.py' for Python. "
-                "   NEVER use 'services/checkout/handler.py' unless that exact file appears in repo_files. "
-                "   NEVER invent module paths — only import from paths that exist in the provided repo_files. "
-                "2. test_code: the test must FAIL on the current buggy code and PASS after the fix. "
-                "   For Node.js: use 'import assert from \"node:assert\";' and plain assert calls. "
-                "   For file-content changes: use fs.readFileSync and assert the new text is present. "
-                "3. run_command: the exact single shell command that runs the test (e.g. 'node tests/test_regression.mjs'). "
-                "4. framework: 'node' for JS/TS projects, 'pytest' for Python projects. "
-                "5. acceptance_criteria: 2-4 plain-English sentences on what a correct fix achieves."
+                "You are an expert Test Automation Architect. Your task is to write robust, self-discovering regression tests.\n"
+                "1. ANALYZE MODULES: Before writing tests, inspect the `repo_files` to determine the module structure. "
+                "   Use `PYTHONPATH=.` to ensure the root directory is importable.\n"
+                "2. DYNAMIC DISCOVERY: Do not hardcode tests for specific functions if the module exposes multiple entry points. "
+                "   If you need to verify variable states, explicitly import them from the target module.\n"
+                "3. STDOUT CAPTURE: To test print() output in Python, you MUST pass `capsys` as a parameter to the test function. "
+                "   CORRECT PATTERN:\n"
+                "   def test_func(capsys):\n"
+                "       func_to_test()\n"
+                "       captured = capsys.readouterr()\n"
+                "       assert 'expected' in captured.out\n"
+                "   NEVER use `pytest.capture` or `pytest.capture.capsys()`. These do not exist.\n"
+                "4. GENERIC IMPORTING: When importing, generate the import path based on the directory structure. "
+                "   If file is at `level_1_syntax/app.py`, import via `from level_1_syntax.app import ...`.\n"
+                "5. ROBUSTNESS: Ensure tests handle the `SyntaxError` case by checking if the module can be imported. "
+                "6. FINAL VALIDATION: Before outputting JSON, perform a mental check: "
+                "   a) Is `capsys` in the function parentheses? (Must be: def test_func(capsys):). "
+                "   b) Did I import every variable/function used? (e.g., 'from module import variable'). "
+                "   c) Is the module path correct relative to root? (PYTHONPATH=. makes the root the base)."
+                "7. run_command: the exact single shell command that runs the test (e.g. 'pip install pytest && PYTHONPATH=. pytest tests/test_regression.py')."
+                "8. CONTEXT-AWARE TESTING: ONLY write tests for files and functions that actually exist in the `repo_files` provided. "
+                "   - Do NOT assume a database exists. "
+                "   - Do NOT assume filesystem paths like '/app/uploads/' exist. "
+                "   - If a module (like level_4_security) is not in `repo_files`, do NOT import or test it. "
+                "   - Focus ONLY on testing the code that is actually present in the provided directory."
             ),
             fallback=_fallback_tests,
         ),
@@ -1502,37 +1582,17 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.FIX],
             mention=agent_mention(Stage.FIX),
             stage=Stage.FIX,
-            provider=Provider.FEATHERLESS,
+            provider=Provider.AIML,
             model_env="PATCH_GENERATOR_MODEL",
-            default_model="Qwen/Qwen2.5-Coder-32B-Instruct",
+            default_model="gpt-4.1-mini",
             output_model=CandidatePatches,
             system_prompt=(
-                "You are an expert software engineer generating minimal patches for a production incident. "
-                "You receive the repo source files, repro logs, and a regression test showing expected behavior. "
-                "Your ONLY output is a valid JSON object matching the CandidatePatches schema — nothing else. "
-                "CRITICAL — you must patch REAL files that exist in repo_files. "
-                "  DO NOT invent file paths. DO NOT use 'services/checkout/handler.py' unless it appears in repo_files. "
-                "  The patch file paths must EXACTLY match keys from repo_files (e.g. 'src/components/Login.tsx'). "
-                "  Read the repo_files carefully to find which file contains the buggy behavior described in the incident. "
-                "  For UI/frontend issues: look in src/ for React/Vue/Svelte components. "
-                "  For Node.js APIs: look for server.ts, app.ts, routes/, or controllers/ files. "
-                "Rules: "
-                "1. Generate EXACTLY two distinct candidate patches. "
-                "2. Each patch must be in standard unified diff format (patch -p1 compatible). "
-                "   The diff header must be: '--- a/<path>' and '+++ b/<path>' (no timestamps). "
-                "   Each hunk header must be '@@ -<old_start>,<old_count> +<new_start>,<new_count> @@'. "
-                "   Context lines (unchanged) must start with a single space. "
-                "   Added lines start with +. Removed lines start with -. "
-                "   Line numbers in @@ must be EXACT — count lines in the file as provided in repo_files. "
-                "3. Candidate 1: the most direct fix (e.g. add credentials hint to UI). "
-                "4. Candidate 2: an alternate approach (e.g. read from config, or slightly different placement). "
-                "5. Each candidate must: "
-                "   - Only change files listed in repo_files. "
-                "   - Use correct relative paths with no leading slash. "
-                "   - Change as few lines as possible. "
-                "6. summary: one sentence describing what this candidate changes and why. "
-                "7. files_changed: list the EXACT relative file paths (matching repo_files keys). "
-                "8. rollback_plan: one sentence describing how to revert."
+                "You are an expert software engineer generating patches for a production incident. "
+                "You receive Pass 1 Docker logs, a regression test, AND 'repository_files' containing the actual source code. "
+                "CRITICAL INSTRUCTION: You MUST base your patch on the actual code provided in 'repository_files'. "
+                "Do NOT hallucinate file paths or code structures. "
+                "Generate exactly two distinct candidate unified diffs in standard patch -p1 format. "
+                "Return JSON only matching the CandidatePatches schema."
             ),
             fallback=_fallback_fix,
         ),
@@ -1540,9 +1600,9 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             name=AGENT_DISPLAY_NAMES[Stage.RCA],
             mention=agent_mention(Stage.RCA),
             stage=Stage.RCA,
-            provider=Provider.OPENROUTER,
+            provider=Provider.AIML,
             model_env="RCA_MODEL",
-            default_model="openai/gpt-oss-120b:free",
+            default_model="gpt-4.1-mini",
             output_model=RCAReport,
             system_prompt=(
                 "You are an SRE writing a simple, formal, publishable root cause analysis report summary. "
@@ -1553,8 +1613,14 @@ def build_agents() -> dict[Stage, IncidentAgent]:
                 "1. title: a concise incident title (e.g. 'Checkout service crashes on null payload'). "
                 "2. incident_summary: 2-3 sentences covering: what failed, when it was detected, who was impacted. "
                 "3. customer_impact: one sentence on the end-user effect (e.g. '100% of checkout requests failed'). "
-                "4. root_cause: the precise technical cause (e.g. 'handle() passes payload directly to process() "
-                "   without a None guard; passing None raises TypeError on payload[\"order_id\"]'). "
+                "4. root_cause: MUST be the EXACT technical cause from the repro logs. "
+                "   - If the error is a SyntaxError due to a missing colon, say: "
+                "     'The function definition on line X was missing a colon (:), causing a SyntaxError.' "
+                "   - If the error is a missing import, say: "
+                "     'The module Y was not imported on line Z, causing a NameError.' "
+                "   - ALWAYS include the specific error type, the exact syntax issue, and the line number if available. "
+                "   - NEVER use vague phrases like 'syntax error in function' or 'code contained a syntax error.' "
+                "   - Be precise: 'missing colon', 'missing parenthesis', 'undefined variable', etc. "
                 "5. timeline: list at least 5 events in chronological order as plain-English strings "
                 "   (e.g. '2024-01-15 14:32 UTC — Alert fired: checkout service returning 500'). "
                 "   Include: alert fired, triage complete, repro confirmed, fix generated, validation passed, RCA published. "
@@ -1565,12 +1631,69 @@ def build_agents() -> dict[Stage, IncidentAgent]:
                 "10. patch_unified_diff: copy the winning patch diff verbatim. "
                 "11. validation_summary: one paragraph: which candidate won, what the test verified, exit code. "
                 "12. final_markdown: a complete markdown RCA report (use ## headings for each section above). "
-                "Be factual — only reference what appears in the logs, patch, and context. Never invent details."
+                "Be factual — only reference what appears in the repro_logs, patch, and context. Never invent details."
             ),
             fallback=_fallback_rca,
         ),
+        Stage.VALIDATE: IncidentAgent(
+    name=AGENT_DISPLAY_NAMES[Stage.VALIDATE],
+    mention=agent_mention(Stage.VALIDATE),
+    stage=Stage.VALIDATE,
+    provider=Provider.AIML,
+    model_env="VALIDATION_MODEL",
+    default_model="gpt-4.1-mini",
+    output_model=ValidationReport,
+    system_prompt=(
+        "You are a senior QA Engineer responsible for validating candidate patches against a regression test suite.\n\n"
+        "You receive:\n"
+        "  - Two candidate unified diffs (CandidatePatches) from the Patch Generator\n"
+        "  - The regression test written by the Test Architect\n"
+        "  - Pass 1 Docker execution logs (pre-patch baseline)\n"
+        "  - The full repository source files\n\n"
+        "Your ONLY output is a valid JSON object matching the ValidationReport schema — nothing else.\n\n"
+        "Rules:\n"
+        "1. patch_results: for EACH candidate patch, produce a PatchResult entry containing:\n"
+        "   a) patch_id: the identifier from CandidatePatches (e.g. 'patch_a', 'patch_b').\n"
+        "   b) applies_cleanly: true if the diff applies without hunk failures, false otherwise.\n"
+        "   c) test_exit_code: the exit code you predict the regression test will produce after the patch (0 = pass).\n"
+        "   d) test_output_summary: 2-3 sentences describing what the test verifies and what the patched code does.\n"
+        "   e) side_effects: list any unintended behaviour changes, new failure modes, or regressions the patch introduces.\n"
+        "      If none, return an empty list.\n"
+        "   f) correctness_score: integer 0-10 rating how completely this patch resolves the root cause.\n\n"
+        "2. winning_patch_id: the patch_id of the candidate that achieves exit code 0, highest correctness_score,\n"
+        "   and fewest side effects. If both patches fail, set to null.\n\n"
+        "3. confidence: one of 'high', 'medium', or 'low'.\n"
+        "   - high: winning patch passes all tests with no side effects.\n"
+        "   - medium: winning patch passes but has minor side effects or residual uncertainty.\n"
+        "   - low: both patches fail or the evidence is ambiguous.\n\n"
+        "4. validation_notes: a single paragraph explaining your reasoning — which patch won, why the other lost,\n"
+        "   and any caveats the RCA agent should be aware of.\n\n"
+        "5. regression_risk: one of 'none', 'low', 'medium', or 'high' — your assessment of how likely the\n"
+        "   winning patch is to introduce a regression in adjacent code paths.\n\n"
+        "6. suggested_followup_tests: list 2-4 additional test cases (as plain English descriptions) that should\n"
+        "   be written to improve coverage around the patched area.\n\n"
+        "CONSTRAINTS:\n"
+        "- Do NOT invent stack traces, log lines, or test output not present in the provided materials.\n"
+        "- Do NOT apply patches speculatively — reason about them statically against the repo source.\n"
+        "- If a patch modifies a file not present in repo_files, mark applies_cleanly as false and explain in side_effects.\n"
+        "- If confidence is 'low', set winning_patch_id to null and explain fully in validation_notes."
+    ),
+    fallback=_fallback_validation,
+),
     }
 
+
+
+
+def _fallback_validation(error: Exception) -> ValidationReport:
+    return ValidationReport(
+        patch_results=[],
+        winning_patch_id=None,
+        confidence="low",
+        validation_notes=f"Validation agent failed with error: {str(error)}. Manual review required.",
+        regression_risk="high",
+        suggested_followup_tests=[],
+    )
 
 def _alert_value(state: IncidentState, key: str, default: str) -> str:
     value = state.raw_alert.payload.get(key, default)
@@ -1663,32 +1786,12 @@ def _placeholder_patch(index: int) -> CodePatch:
 
 
 def _fallback_fix(state: IncidentState) -> CandidatePatches:
-    handler_path = _demo_handler_rel_path(state)
-    if handler_path is None:
-        state.errors.append(
-            "fix: no LLM and this repository is not the demo Python layout "
-            "(services/<service>/handler.py). Set LIVE_LLM_ENABLED=true in .env "
-            "and MAX_RUN_USD>0 for real GitHub projects."
-        )
-        return CandidatePatches(
-            candidates=[_placeholder_patch(0), _placeholder_patch(1)],
-        )
+    # Repo-aware requirement: if we don't have repo context, never generate placeholder diffs.
+    # This prevents committing hallucinated patches such as services/unknown-service/...
+    raise RuntimeError(
+        "FIX agent requires repository_files (state.repo_path must be set and loadable)."
+    )
 
-    service = handler_path.split("/")[1] if "/" in handler_path else "service"
-    candidates = [
-        CodePatch(
-            summary=(
-                f"Candidate {index + 1}: add defensive validation around failing path "
-                f"in {service}."
-            ),
-            files_changed=[handler_path],
-            patch_unified_diff=_fallback_patch_diff(handler_path, index),
-            risk_notes=["Placeholder patch; replace with repository-specific diff after repro."],
-            rollback_plan="Revert the patch commit and redeploy the previous stable artifact.",
-        )
-        for index in range(MAX_VALIDATION_CANDIDATES)
-    ]
-    return CandidatePatches(candidates=candidates)
 
 
 def _fallback_patch_diff(handler_path: str, index: int) -> str:
