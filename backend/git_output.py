@@ -108,10 +108,16 @@ def _push_fix_as_pr_sync(state: IncidentState, repo_path: str) -> str:
     remote = f"https://x-access-token:{gh_token}@github.com/{repo_full_name}.git"
     _run_cmd(["git", "remote", "set-url", "origin", remote], cwd=repo_path)
 
+    # Clean working tree before checkout to avoid conflicts or carrying over dirty changes
     try:
-        _run_cmd(["git", "checkout", "-b", branch_name], cwd=repo_path)
-    except RuntimeError:
-        _run_cmd(["git", "checkout", branch_name], cwd=repo_path)
+        _run_cmd(["git", "reset", "--hard", "HEAD"], cwd=repo_path)
+        _run_cmd(["git", "clean", "-fd"], cwd=repo_path)
+    except Exception:
+        pass
+
+    base_branch = os.getenv("GITHUB_PR_BASE_BRANCH", "main")
+    _run_cmd(["git", "fetch", "origin", base_branch], cwd=repo_path)
+    _run_cmd(["git", "checkout", "-B", branch_name, f"origin/{base_branch}"], cwd=repo_path)
 
     # ADDED newline="" to stop Windows from corrupting the patch file
     with tempfile.NamedTemporaryFile(
@@ -122,15 +128,28 @@ def _push_fix_as_pr_sync(state: IncidentState, repo_path: str) -> str:
     # File must be closed before _run_cmd opens it (required on Windows).
 
     try:
-        # Check if fix_export.py already applied the changes to the files
-        already_applied = state.fix_export and state.fix_export.get("applied_to_repo")
-        
-        # Only apply the patch if it hasn't been applied yet!
-        if not already_applied:
+        # Always apply the patch on the clean branch (recount option helps with line number mismatches)
+        applied_successfully = False
+        apply_error = ""
+        try:
             _run_cmd(
-                ["git", "apply", "-p1", "--ignore-space-change", "--whitespace=nowarn", patch_file],
+                ["git", "apply", "-p1", "--ignore-space-change", "--whitespace=nowarn", "--recount", patch_file],
                 cwd=repo_path,
             )
+            applied_successfully = True
+        except Exception as exc:
+            apply_error = str(exc)
+
+        if not applied_successfully:
+            from backend.fix_export import apply_patch_to_repo
+            ok, msg = apply_patch_to_repo(repo_path, patch_diff, strip=1)
+            if ok:
+                applied_successfully = True
+            else:
+                apply_error += f"\nFallback apply_patch_to_repo also failed: {msg}"
+
+        if not applied_successfully:
+            raise RuntimeError(f"Failed to apply patch on branch {branch_name}:\n{apply_error}")
     finally:
         try:
             os.unlink(patch_file)
@@ -141,7 +160,7 @@ def _push_fix_as_pr_sync(state: IncidentState, repo_path: str) -> str:
     _run_cmd(["git", "commit", "-m", commit_message], cwd=repo_path)
     _run_cmd(["git", "push", "origin", branch_name], cwd=repo_path)
 
-    base_branch = os.getenv("GITHUB_PR_BASE_BRANCH", "main")
+
     validation_block = ""
     if state.rca.validation_summary:
         validation_block = f"\n\n## Validation\n{state.rca.validation_summary}"

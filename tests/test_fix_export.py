@@ -43,6 +43,25 @@ class FixExportTests(unittest.TestCase):
             self.assertTrue(ok, detail)
             self.assertIn("if x is None", target.read_text(encoding="utf-8"))
 
+    def test_apply_corrupt_patch_to_repo(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            target = root / "handler.py"
+            target.write_text("def handle(x):\n    return x\n", encoding="utf-8")
+            # This patch has incorrect line numbers in hunk header and context lines are missing leading spaces
+            patch = (
+                "--- a/handler.py\n"
+                "+++ b/handler.py\n"
+                "@@ -1,999 +1,999 @@\n"
+                "def handle(x):\n"
+                "+    if x is None:\n"
+                "+        return {}\n"
+                "return x\n"
+            )
+            ok, detail = apply_patch_to_repo(root, patch)
+            self.assertTrue(ok, detail)
+            self.assertIn("if x is None", target.read_text(encoding="utf-8"))
+
     def test_export_validated_fix_writes_artifacts(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

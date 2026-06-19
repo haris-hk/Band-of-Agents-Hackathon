@@ -43,14 +43,22 @@ def _apply_hunk(file_lines: list[str], hunk_lines: list[str], old_start: int) ->
     for row in hunk_lines:
         if not row or row.startswith("\\"):
             continue
-        tag, content = row[0], row[1:]
+        if row.startswith("-"):
+            tag, content = "-", row[1:]
+        elif row.startswith("+"):
+            tag, content = "+", row[1:]
+        elif row.startswith(" "):
+            tag, content = " ", row[1:]
+        else:
+            tag, content = " ", row
+
         if tag == " ":
-            if cursor >= len(file_lines) or file_lines[cursor] != content:
+            if cursor >= len(file_lines) or file_lines[cursor].strip() != content.strip():
                 return False, f"context mismatch near line {cursor + 1}", file_lines
-            result.append(content)
+            result.append(file_lines[cursor])
             cursor += 1
         elif tag == "-":
-            if cursor >= len(file_lines) or file_lines[cursor] != content:
+            if cursor >= len(file_lines) or file_lines[cursor].strip() != content.strip():
                 return False, f"delete mismatch near line {cursor + 1}", file_lines
             cursor += 1
         elif tag == "+":
@@ -129,7 +137,7 @@ def apply_patch_to_repo(repo_path: str | Path, patch_diff: str, strip: int = 1) 
 
     try:
         ok, detail = _run_cmd(
-            ["git", "apply", f"-p{strip}", "--whitespace=nowarn", patch_file],
+            ["git", "apply", f"-p{strip}", "--ignore-space-change", "--whitespace=nowarn", "--recount", patch_file],
             root,
         )
         if ok:

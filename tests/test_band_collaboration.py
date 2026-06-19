@@ -115,9 +115,14 @@ class BandCollaborationTests(unittest.IsolatedAsyncioTestCase):
         orchestrator = IncidentOrchestrator()
         orchestrator.agents = fake_agents()
 
+        async def fake_prepare_repository(state, alert):
+            state.repo_path = "/fake/repo/path"
+            state.repo_files = {"services/checkout/handler.py": "def handle(x):\n    return x\n"}
+
         with (
             patch("backend.agent_loop.run_repro_pass1", fake_repro_pass1),
             patch("backend.agent_loop.run_validation_swarm", fake_validation_swarm),
+            patch.object(orchestrator, "_prepare_repository", fake_prepare_repository),
         ):
             events = [
                 event
