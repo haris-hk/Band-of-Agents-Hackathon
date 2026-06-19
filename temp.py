@@ -2,7 +2,7 @@ import requests
 import json
 
 AGENT_KEY = "band_a_1781718378_oGUOGcE1RkdxVP9apFtoOvUiIvU-3NSJ"
-ROOM_ID = "a16e6f9b-0e0b-49a6-8d0b-f3ea2e7fa5ad"
+ROOM_ID = "b03e5ffe-59e1-48a1-97c9-2345db411b1d"
 
 alert_data = {
     "repo_url": "https://github.com/hamzaraza123/mock-buggy-project",

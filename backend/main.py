@@ -355,16 +355,45 @@ async def heartbeat(ws: WebSocket) -> None:
 
 async def run_incident(alert: dict[str, Any]) -> None:
     METRICS.inc("incidents_started")
-    orchestrator = IncidentOrchestrator()
     try:
-        async for event in orchestrator.run(alert):
-            payload = event.model_dump(mode="json")
-            append_run_event(str(event.run_id), payload)
-            await hub.broadcast(payload)
-            if event.status == "done":
-                METRICS.inc("incidents_done")
-            elif event.status == "failed" and event.agent == "orchestrator":
-                METRICS.inc("incidents_failed")
+        import requests
+        import json
+        import os
+        from backend.run_store import append_run_event
+        
+        agent_key = "band_a_1781718378_oGUOGcE1RkdxVP9apFtoOvUiIvU-3NSJ"
+        room_id = "b03e5ffe-59e1-48a1-97c9-2345db411b1d"
+
+        alert_data = {
+            "repo_url": "https://github.com/hamzaraza123/mock-buggy-project",
+            "error": "Fix syntax error in level_1_syntax/app.py",
+            "impact": "error",
+            "service_short": "mock-buggy-project",
+            "severity": "sev2",
+            "auto_pr": "true",
+        }
+
+        data = {
+            "message": {
+                "content": f"@alert-triager\n```json\n{json.dumps(alert_data, indent=2)}\n```",
+                "mentions": [
+                    {"handle": "zealox587/alert-triager"}
+                ]
+            }
+        }
+        
+        import asyncio
+        response = await asyncio.to_thread(
+            requests.post,
+            f"https://app.band.ai/api/v1/agent/chats/{room_id}/messages",
+            headers={
+                "X-API-Key": agent_key,
+                "Content-Type": "application/json"
+            },
+            json=data
+        )
+        response.raise_for_status()
+        
     except Exception as exc:
         METRICS.inc("incidents_failed")
         await hub.broadcast(failure_payload(str(exc)))

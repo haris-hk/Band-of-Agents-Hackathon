@@ -121,13 +121,23 @@ export function ReportTab({
               </button>
             )}
             {runId && apiBase && (terminal === "done" || terminal === "failed") && (
-              <a
-                className="primaryButton"
-                href={`${apiBase}/runs/${runId}/report.html`}
-                download={`incident-${runId.slice(0, 8)}.html`}
-              >
-                ⬇ Download Report
-              </a>
+              <>
+                <a
+                  className="secondaryButton"
+                  href={`${apiBase}/runs/${runId}/report.html`}
+                  target="_blank"
+                  rel="noreferrer"
+                >
+                  ↗ View Report
+                </a>
+                <a
+                  className="primaryButton"
+                  href={`${apiBase}/runs/${runId}/report.html`}
+                  download={`incident-${runId.slice(0, 8)}.html`}
+                >
+                  ⬇ Download Report
+                </a>
+              </>
             )}
           </div>
         </div>

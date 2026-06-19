@@ -251,9 +251,13 @@ button:disabled {
 }
 
 .secondaryButton {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   background: var(--bg-input);
   color: var(--text-primary);
   border: 1px solid var(--border-light);
+  text-decoration: none;
 }
 
 .secondaryButton:hover:not(:disabled) {
@@ -678,8 +682,12 @@ button:disabled {
 /* --- Markdown Report --- */
 
 .reportSectionHeader {
-  display: flex; justify-content: space-between; align-items: baseline;
+  display: flex; justify-content: space-between; align-items: center;
   border-bottom: 1px solid var(--border-light); padding-bottom: 12px; margin-bottom: 20px;
+}
+
+.reportSectionActions {
+  display: inline-flex; align-items: center; gap: 8px; flex-wrap: wrap;
 }
 
 .reportSection h3, .changesSection h3 {

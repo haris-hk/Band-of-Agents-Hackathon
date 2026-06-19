@@ -46,7 +46,26 @@ class CustomAdapter(SimpleAdapter[Any]):
         room_id: str,
     ) -> None:
         state = _state_from_message(msg.content)
+        
+        if self.stage_agent.stage == Stage.TRIAGE:
+            alert = state.raw_alert.payload
+            repo_url = alert.get("repo_url")
+            if repo_url:
+                from backend.repo_access import clone_repository
+                repo_path_hint = alert.get("repo_path", "")
+                try:
+                    repo_path, repo_full_name = await clone_repository(repo_url, repo_path_hint)
+                    state.repo_path = repo_path
+                    state.repo_full_name = repo_full_name
+                except Exception as e:
+                    print(f"Failed to clone repository: {e}")
+
         output = await self.stage_agent.run(state, self.llm)
+        
+        if self.stage_agent.stage == Stage.REPRO:
+            from backend.agent_loop import run_repro_pass1
+            state.repro_execution = await run_repro_pass1(state, output)
+
         _merge_stage_output(state, self.stage_agent.stage, output)
         payload = json.dumps(
             _handoff_payload(state, self.stage_agent.stage, output),
@@ -92,8 +111,22 @@ async def run_band_agents() -> None:
 
 def _payload_from_message(content: str) -> dict[str, Any]:
     try:
-        return json.loads(content[content.index("{") :])
-    except Exception:
+        start_idx = content.find("{")
+        if start_idx == -1:
+            raise ValueError("No JSON object found")
+        
+        # Find the last closing brace to handle trailing markdown/text
+        end_idx = content.rfind("}")
+        if end_idx == -1 or end_idx < start_idx:
+            raise ValueError("No closing brace found")
+            
+        json_str = content[start_idx : end_idx + 1]
+        
+        # If the string has unescaped quotes inside quotes (e.g., from a chat UI stripping backslashes),
+        # we try to parse it. If it fails, we fall back to the safe message dict.
+        return json.loads(json_str)
+    except Exception as e:
+        print(f"🔍 [DEBUG] Failed to parse payload JSON: {e}")
         return {"message": content}
 
 

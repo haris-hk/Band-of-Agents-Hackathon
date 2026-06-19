@@ -32,7 +32,7 @@ AGENT_DISPLAY_NAMES: dict[Stage, str] = {
 }
 
 def agent_mention(stage: Stage) -> str:
-    username = os.getenv("BAND_USERNAME", "").strip().lstrip("@")
+    username = os.getenv("BAND_USERNAME", "zealox587").strip().lstrip("@")
     slug = AGENT_SLUGS[stage]
     if not username:
         return f"@{slug}"

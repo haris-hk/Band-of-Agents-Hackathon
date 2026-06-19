@@ -19,6 +19,7 @@ type PipelineStep = { stage: string; label: string };
 type HealthState = {
   loading: boolean;
   dockerAvailable: boolean | null;
+  dockerSmokeOk: boolean | null;
   dockerMessage: string | null;
   dockerRemediation: string | null;
   backendOk: boolean;
@@ -85,6 +86,7 @@ export default function IncidentDashboard() {
   const [health, setHealth] = useState<HealthState>({
     loading: true,
     dockerAvailable: null,
+    dockerSmokeOk: null,
     dockerMessage: null,
     dockerRemediation: null,
     backendOk: false,
@@ -101,13 +103,15 @@ export default function IncidentDashboard() {
       }
       const data = (await response.json()) as {
         docker_available?: boolean;
+        docker_smoke_ok?: boolean | null;
         docker_message?: string | null;
         docker_remediation?: string | null;
       };
       setHealth({
         loading: false,
         backendOk: true,
-        dockerAvailable: Boolean(data.docker_available),
+        dockerAvailable: data.docker_available ?? null,
+        dockerSmokeOk: data.docker_smoke_ok ?? null,
         dockerMessage: data.docker_message ?? null,
         dockerRemediation: data.docker_remediation ?? null,
         error: null,
@@ -119,6 +123,7 @@ export default function IncidentDashboard() {
         loading: false,
         backendOk: false,
         dockerAvailable: null,
+        dockerSmokeOk: null,
         dockerMessage: null,
         dockerRemediation: null,
         error: message,
@@ -126,8 +131,17 @@ export default function IncidentDashboard() {
     }
   }, []);
 
+  // Initial fetch + periodic health poll every 30 s
   useEffect(() => {
     void refreshHealth();
+    const interval = setInterval(() => {
+      void refreshHealth();
+    }, 30_000);
+    return () => clearInterval(interval);
+  }, [refreshHealth]);
+
+  // Pre-fetch the demo alert payload once on mount
+  useEffect(() => {
     void fetch(`${API_BASE}/demo/alert`)
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
@@ -136,7 +150,8 @@ export default function IncidentDashboard() {
       .catch(() => {
         /* optional until backend is up */
       });
-  }, [refreshHealth]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const scopedEvents = useMemo(() => {
     if (!runId) return events;
@@ -252,6 +267,21 @@ export default function IncidentDashboard() {
     ws.send(JSON.stringify({ alert }));
   }
 
+  /** POST /incidents as an alternative submission path (used when WS is unavailable). */
+  async function submitViaHttp(alert: Record<string, unknown>): Promise<void> {
+    const headers: Record<string, string> = { "Content-Type": "application/json" };
+    if (INCIDENT_API_KEY) headers["X-API-Key"] = INCIDENT_API_KEY;
+    const response = await fetch(`${API_BASE}/incidents`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ alert }),
+    });
+    if (!response.ok) {
+      const text = await response.text().catch(() => "");
+      throw new Error(`POST /incidents failed (${response.status}): ${text}`);
+    }
+  }
+
   function runPipeline() {
     if (!health.backendOk) {
       setConnectionError(
@@ -284,15 +314,25 @@ export default function IncidentDashboard() {
 
     ws.onopen = () => {
       setConnected(true);
+      // Primary path: send the alert over the same WebSocket connection.
+      // The backend starts the pipeline and streams AgentEvents back over this socket.
       submitViaWebSocket(ws!);
     };
     ws.onmessage = (message) => {
-      const event = JSON.parse(message.data) as AgentEvent;
+      let event: AgentEvent;
+      try {
+        event = JSON.parse(message.data as string) as AgentEvent;
+      } catch {
+        // Ignore non-JSON frames (should not happen with well-behaved backend)
+        return;
+      }
+      // Handle heartbeat ping — respond with pong and ignore
       if (event.type === "ping") {
         ws?.send(JSON.stringify({ type: "pong" }));
         return;
       }
       setEvents((current) => [...current, event]);
+      // Capture the run_id from the event itself or from the queued payload
       if (event.run_id) {
         setRunId(event.run_id);
       } else if (event.status === "queued") {
@@ -323,10 +363,24 @@ export default function IncidentDashboard() {
     };
     ws.onerror = () => {
       setConnected(false);
-      setRunning(false);
-      setConnectionError(
-        `Cannot connect to ${buildWsUrl()}. Start the backend and refresh health.`,
-      );
+      // Fallback: if the WS can't connect, submit via POST /incidents so the pipeline
+      // still starts on the backend. The user won't get live streaming but the run starts.
+      const alert = buildAlert();
+      void submitViaHttp(alert)
+        .then(() => {
+          // Pipeline started via HTTP; inform the user the WS streaming is unavailable.
+          setConnectionError(
+            `WebSocket unavailable — pipeline submitted via HTTP. Live event stream is offline. Check backend logs.`,
+          );
+          setRunning(false);
+        })
+        .catch((err: unknown) => {
+          const msg = err instanceof Error ? err.message : String(err);
+          setRunning(false);
+          setConnectionError(
+            `Cannot connect to ${buildWsUrl()} and HTTP fallback also failed: ${msg}`,
+          );
+        });
     };
   }
 
@@ -410,6 +464,22 @@ export default function IncidentDashboard() {
                   : health.dockerAvailable === false
                     ? "down"
                     : "?"}
+              </li>
+              <li
+                className={
+                  health.dockerSmokeOk === true
+                    ? "healthOk"
+                    : health.dockerSmokeOk === false
+                      ? "healthBad"
+                      : "healthWarn"
+                }
+              >
+                Smoke test{" "}
+                {health.dockerSmokeOk === true
+                  ? "pass"
+                  : health.dockerSmokeOk === false
+                    ? "fail"
+                    : "—"}
               </li>
             </ul>
           </div>
