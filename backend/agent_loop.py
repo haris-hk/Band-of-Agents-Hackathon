@@ -1464,6 +1464,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             default_model="batiai/qwen3.6-27b:iq4",
             output_model=IncidentContext,
             system_prompt=(
+<<<<<<< HEAD
                 "You are an expert on-call incident triager at a high-traffic engineering team.\n\n"
                 "STEP 1 — UNDERSTAND THE USER (most important step):\n"
                 "The 'error' field is a free-text description written by a non-technical user who may not know "
@@ -1484,6 +1485,35 @@ def build_agents() -> dict[Stage, IncidentAgent]:
                 "9. investigation_plan: a step-by-step plan for the Patch Generator agent to fix the code without hallucinating paths.\n"
                 "10. NEVER invent stack traces, error messages, or file paths not present in the repo_files.\n"
                 "11. If a field cannot be determined, use null — never guess."
+=======
+                "You are an SRE writing a simple, formal, publishable root cause analysis report summary. "
+                "You receive the winning patch, validation evidence, and the full incident context. "
+                "Keep the final summary simple and easy to read for the end user. "
+                "Your ONLY output is a valid JSON object matching the RCAReport schema — nothing else. "
+                "Rules: "
+                "1. title: a concise incident title (e.g. 'Checkout service crashes on null payload'). "
+                "2. incident_summary: 2-3 sentences covering: what failed, when it was detected, who was impacted. "
+                "3. customer_impact: one sentence on the end-user effect (e.g. '100 percent of checkout requests failed'). "
+                "4. root_cause: MUST be the EXACT technical cause from the repro logs. "
+                "   - If the error is a SyntaxError due to a missing colon, say: "
+                "     'The function definition on line X was missing a colon (:), causing a SyntaxError.' "
+                "   - If the error is a missing import, say: "
+                "     'The module Y was not imported on line Z, causing a NameError.' "
+                "   - ALWAYS include the specific error type, the exact syntax issue, and the line number if available. "
+                "   - NEVER use vague phrases like 'syntax error in function' or 'code contained a syntax error.' "
+                "   - Be precise: 'missing colon', 'missing parenthesis', 'undefined variable', etc. "
+                "5. timeline: list at least 5 events in chronological order as plain-English strings "
+                "   (e.g. '2024-01-15 14:32 UTC — Alert fired: checkout service returning 500'). "
+                "   Include: alert fired, triage complete, repro confirmed, fix generated, validation passed, RCA published. "
+                "6. contributing_factors: list 2-4 factors that allowed this bug to reach production. "
+                "7. prevention_recommendations: list 3-5 actionable items to prevent recurrence. "
+                "8. git_branch: branch name in format 'fix/<service>-<slug>' (e.g. 'fix/checkout-null-payload'). "
+                "9. commit_message: conventional commit format: 'fix(<scope>): <what was fixed>' (max 72 chars). "
+                "10. patch_unified_diff: copy the winning patch diff verbatim. "
+                "11. validation_summary: one paragraph: which candidate won, what the test verified, exit code. "
+                "12. final_markdown: a complete markdown RCA report (use ## headings for each section above). "
+                "Be factual — only reference what appears in the repro_logs, patch, and context. Never invent details."
+>>>>>>> 4bb168d (update)
             ),
             fallback=_fallback_triage,
         ),
