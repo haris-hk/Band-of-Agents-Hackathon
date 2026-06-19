@@ -51,10 +51,9 @@ class CustomAdapter(SimpleAdapter[Any]):
             alert = state.raw_alert.payload
             repo_url = alert.get("repo_url")
             if repo_url:
-                from backend.repo_access import clone_repository
-                repo_path_hint = alert.get("repo_path", "")
+                from backend.repo_access import ensure_repo_checkout
                 try:
-                    repo_path, repo_full_name = await clone_repository(repo_url, repo_path_hint)
+                    repo_path, repo_full_name = await ensure_repo_checkout(alert)
                     state.repo_path = repo_path
                     state.repo_full_name = repo_full_name
                 except Exception as e:
@@ -65,6 +64,18 @@ class CustomAdapter(SimpleAdapter[Any]):
         if self.stage_agent.stage == Stage.REPRO:
             from backend.agent_loop import run_repro_pass1
             state.repro_execution = await run_repro_pass1(state, output)
+
+        import requests
+        try:
+            requests.post("http://localhost:8000/webhooks/local-events", json={
+                "run_id": room_id,
+                "stage": self.stage_agent.stage.value,
+                "agent": self.stage_agent.name,
+                "status": "done",
+                "payload": output.model_dump(mode="json")
+            })
+        except Exception as e:
+            print(f"🔍 [DEBUG] Failed to broadcast local event: {e}")
 
         _merge_stage_output(state, self.stage_agent.stage, output)
         payload = json.dumps(

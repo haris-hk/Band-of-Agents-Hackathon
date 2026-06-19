@@ -410,6 +410,13 @@ def failure_payload(error: str, run_id: str = "") -> dict[str, Any]:
     }
 
 
+@app.post("/webhooks/local-events")
+async def local_events(request: Request) -> dict[str, str]:
+    payload = await request.json()
+    await hub.broadcast(payload)
+    return {"status": "ok"}
+
+
 @app.post("/webhooks/github")
 async def github_webhook(
     request: Request,
