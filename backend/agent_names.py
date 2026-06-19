@@ -18,7 +18,7 @@ AGENT_SLUGS: dict[Stage, str] = {
     Stage.REPRO: "incident-reproducer",
     Stage.FIX: "patch-generator",
     Stage.VALIDATE: "qa-validator",
-    Stage.TEST: "test-generator",
+    Stage.TEST: "regression-test-generato",
     Stage.RCA: "rca-publisher",
 }
 

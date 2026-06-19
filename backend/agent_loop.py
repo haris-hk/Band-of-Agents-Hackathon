@@ -136,10 +136,17 @@ class IncidentAgent:
         # Resolve repo path (fallback to alert payload if state isn't explicitly set)
         active_repo_path = state.repo_path or state.raw_alert.payload.get("repo_path")
 
+        print(f"🔍 [DEBUG] IncidentAgent.run() - stage: {self.stage}")
+        print(f"🔍 [DEBUG] active_repo_path: {active_repo_path}")
+        print(f"🔍 [DEBUG] state.repo_path: {state.repo_path}")
+        print(f"🔍 [DEBUG] raw_alert.payload keys: {list(state.raw_alert.payload.keys())}")
+
        # INJECT REAL CODE: Only for agents that need to see code
         if active_repo_path and self.stage in {Stage.REPRO, Stage.TEST, Stage.FIX, Stage.VALIDATE}:
             state_dict["repository_files"] = load_repo_files(active_repo_path)
-
+            print(f"🔍 [DEBUG] Loaded {len(state_dict.get('repository_files', {}))} files for {self.stage}")
+        else:
+            print(f"🔍 [DEBUG] SKIPPING repo load: active_repo_path={active_repo_path}, stage={self.stage}")
         # Include exact repro logs for RCA so it can cite specific line numbers and error types
         if self.stage == Stage.RCA and state.repro_execution:
             state_dict["repro_logs"] = state.repro_execution.logs
@@ -147,13 +154,18 @@ class IncidentAgent:
         prompt = json.dumps(state_dict, separators=(",", ":"))
 
         try:
-            return await llm.json_call(
+            output = await llm.json_call(
                 provider=self.provider,
                 model=self.model_name,
                 system=self.system_prompt,
                 user=prompt,
                 output_model=self.output_model,
             )
+            if self.stage == Stage.FIX:
+                print(f"🔍 [DEBUG] Fix agent: LLM call completed, output type: {type(output)}")
+                print(f"🔍 [DEBUG] Fix agent: output: {output}")
+                print(f"🔍 [DEBUG] Fix agent: state.candidate_patches: {state.candidate_patches}")
+            return output
         except GuardrailBlocked:
             return self.fallback(state)
         except (KeyboardInterrupt, SystemExit):
@@ -364,6 +376,9 @@ class DockerContainerExecutor:
         await asyncio.to_thread(self._cleanup_sync, True)
 
     def _start_container(self) -> None:
+        print(f"🔍 [DEBUG] Starting Docker container for {self.label}")
+        print(f"🔍 [DEBUG] repo_path: {self.config.repo_path}")
+        print(f"🔍 [DEBUG] image: {self.config.image}")
         if not self.config.repo_path.exists():
             raise FileNotFoundError(f"repo_path does not exist: {self.config.repo_path}")
 
@@ -1043,6 +1058,9 @@ class IncidentOrchestrator:
         self.agents = build_agents()
 
     async def run(self, alert: dict[str, Any]) -> AsyncIterator[AgentEvent]:
+        print(f"🔍 [DEBUG] Orchestrator.run() called with alert keys: {list(alert.keys())}")
+        print(f"🔍 [DEBUG] repo_url: {alert.get('repo_url')}")
+        print(f"🔍 [DEBUG] repo_path: {alert.get('repo_path')}")
         # Extract repo context immediately
         repo_path = alert.get("repo_path", "")
         # Fallback to service name if full name isn't provided, to prevent crashes
@@ -1059,6 +1077,7 @@ class IncidentOrchestrator:
         # ADD THIS BLOCK HERE TO FIX THE CLONE ERROR
         # ==========================================
         await self._prepare_repository(state, alert)
+        print(f"🔍 [DEBUG] After _prepare_repository: repo_path={state.repo_path}, repo_files count={len(state.repo_files)}")
         if state.current_stage == Stage.FAILED:
             async for event in self._finalize_run(state, alert):
                 yield event
@@ -1173,8 +1192,10 @@ class IncidentOrchestrator:
 
             state.current_stage = next_stage
 
+        print(f"🔍 [DEBUG] Orchestrator.run() completed. Calling _finalize_run...")
         async for event in self._finalize_run(state, alert):
             yield event
+        print(f"🔍 [DEBUG] _finalize_run completed")
 
     async def _finalize_run(
         self,
@@ -1207,7 +1228,14 @@ class IncidentOrchestrator:
 
         pr_url: str | None = None
         pr_error: str | None = None
-        auto_pr = bool(alert.get("auto_pr"))
+        auto_pr_raw = alert.get("auto_pr")
+        print(f"🔍 [DEBUG] auto_pr_raw: {auto_pr_raw}")
+        print(f"🔍 [DEBUG] auto_pr_raw type: {type(auto_pr_raw)}")
+        auto_pr = bool(auto_pr_raw)
+        print(f"🔍 [DEBUG] auto_pr after bool: {auto_pr}")
+        print(f"🔍 [DEBUG] state.repo_path: {state.repo_path}")
+        print(f"🔍 [DEBUG] state.rca: {state.rca is not None}")
+        print(f"🔍 [DEBUG] state.fix: {state.fix is not None}")
 
         if auto_pr and state.rca and state.rca.patch_unified_diff and state.fix:
             try:
@@ -1461,7 +1489,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             stage=Stage.TRIAGE,
             provider=Provider.AIML,
             model_env="TRIAGE_MODEL",
-            default_model="batiai/qwen3.6-27b:iq4",
+            default_model="gpt-4.1-mini",
             output_model=IncidentContext,
             system_prompt=(
                 "You are an expert on-call incident triager at a high-traffic engineering team.\n\n"
@@ -1493,7 +1521,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             stage=Stage.REPRO,
             provider=Provider.AIML,
             model_env="REPRO_MODEL",
-            default_model="alibaba/qwen3.6-35b-a3b",
+            default_model="gpt-4.1-mini",
             output_model=ReproPlan,
             system_prompt=(
                 "You are a senior SRE designing a deterministic Docker reproduction of a production incident. "
@@ -1519,7 +1547,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             stage=Stage.TEST,
             provider=Provider.AIML,
             model_env="REGRESSION_TEST_MODEL",
-            default_model="alibaba/qwen3.6-35b-a3b",
+            default_model="gpt-4.1-mini",
             output_model=RegressionTests,
             system_prompt=(
                 "You are an expert Test Automation Architect. Your task is to write robust, self-discovering regression tests.\n"
@@ -1556,7 +1584,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             stage=Stage.FIX,
             provider=Provider.AIML,
             model_env="PATCH_GENERATOR_MODEL",
-            default_model="alibaba/qwen3.6-35b-a3b",
+            default_model="gpt-4.1-mini",
             output_model=CandidatePatches,
             system_prompt=(
                 "You are an expert software engineer generating patches for a production incident. "
@@ -1574,7 +1602,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
             stage=Stage.RCA,
             provider=Provider.AIML,
             model_env="RCA_MODEL",
-            default_model="alibaba/qwen3.6-35b-a3b",
+            default_model="gpt-4.1-mini",
             output_model=RCAReport,
             system_prompt=(
                 "You are an SRE writing a simple, formal, publishable root cause analysis report summary. "
@@ -1613,7 +1641,7 @@ def build_agents() -> dict[Stage, IncidentAgent]:
     stage=Stage.VALIDATE,
     provider=Provider.AIML,
     model_env="VALIDATION_MODEL",
-    default_model="alibaba/qwen3.6-35b-a3b",
+    default_model="gpt-4.1-mini",
     output_model=ValidationReport,
     system_prompt=(
         "You are a senior QA Engineer responsible for validating candidate patches against a regression test suite.\n\n"

@@ -193,8 +193,11 @@ async def ensure_repo_checkout(alert: dict[str, Any]) -> tuple[str, str | None]:
 
     Returns (repo_path, error_message). error_message is None on success.
     """
+    print(f"🔍 [DEBUG] ensure_repo_checkout called with alert keys: {list(alert.keys())}")
     repo_url: str | None = alert.get("repo_url")
     repo_path: str | None = alert.get("repo_path")
+    print(f"🔍 [DEBUG] repo_url={repo_url}, repo_path={repo_path}")
+    print(f"🔍 [DEBUG] repo_path: {repo_path}")
 
     # FIX: derive repo_path from repo_url when not explicitly provided
     if not repo_path and repo_url:
