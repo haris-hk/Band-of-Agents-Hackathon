@@ -6,6 +6,7 @@ import hmac
 import json
 import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -353,50 +354,110 @@ async def heartbeat(ws: WebSocket) -> None:
         await hub.send_json(ws, {"type": "ping"})
 
 
-async def run_incident(alert: dict[str, Any]) -> None:
-    METRICS.inc("incidents_started")
+def _get_alert_triager_api_key() -> str | None:
+    """Read the alert_triager API key from agent_config.yaml."""
     try:
-        import requests
-        import json
-        import os
-        from backend.run_store import append_run_event
-        
-        agent_key = "band_a_1781718378_oGUOGcE1RkdxVP9apFtoOvUiIvU-3NSJ"
-        room_id = "b03e5ffe-59e1-48a1-97c9-2345db411b1d"
+        import yaml
+        config_path = os.path.join(os.path.dirname(__file__), "..", "agent_config.yaml")
+        with open(config_path) as f:
+            config = yaml.safe_load(f)
+        return config.get("alert_triager", {}).get("api_key")
+    except Exception as exc:
+        logger.warning("Could not read agent_config.yaml: %s", exc)
+        return None
 
-        alert_data = {
-            "repo_url": "https://github.com/hamzaraza123/mock-buggy-project",
-            "error": "Fix syntax error in level_1_syntax/app.py",
-            "impact": "error",
-            "service_short": "mock-buggy-project",
-            "severity": "sev2",
-            "auto_pr": "true",
-        }
+
+async def run_incident(alert: dict[str, Any]) -> None:
+    """Post the user's alert into the Band chatroom, mentioning the Alert Triager."""
+    METRICS.inc("incidents_started")
+    run_id = str(uuid.uuid4())
+
+    # 1. Read config
+    room_id = os.getenv("BAND_ROOM_ID", "").strip()
+    if not room_id:
+        error = "BAND_ROOM_ID is not set in .env"
+        logger.error(error)
+        await hub.broadcast(failure_payload(error, run_id))
+        METRICS.inc("incidents_failed")
+        return
+
+    agent_key = _get_alert_triager_api_key()
+    if not agent_key:
+        error = "Cannot read alert_triager api_key from agent_config.yaml"
+        logger.error(error)
+        await hub.broadcast(failure_payload(error, run_id))
+        METRICS.inc("incidents_failed")
+        return
+
+    # 2. Broadcast "queued" event to frontend
+    await hub.broadcast({
+        "run_id": run_id,
+        "stage": "triage",
+        "agent": "orchestrator",
+        "status": "queued",
+        "payload": {
+            "run_id": run_id,
+            "alert": alert,
+            "docker_available": True,
+            "pipeline": [
+                {"stage": "triage", "label": "Triage"},
+                {"stage": "repro", "label": "Reproduce"},
+                {"stage": "test", "label": "Test"},
+                {"stage": "fix", "label": "Fix"},
+                {"stage": "validate", "label": "Validate"},
+                {"stage": "rca", "label": "RCA"},
+            ],
+            "agents": [
+                {"name": "Alert Triager", "mention": "@alert-triager", "stage": "triage", "kind": "band"},
+                {"name": "Incident Reproducer", "mention": "@incident-reproducer", "stage": "repro", "kind": "band"},
+                {"name": "Regression Test Generator", "mention": "@test-generator", "stage": "test", "kind": "band"},
+                {"name": "Patch Generator", "mention": "@patch-generator", "stage": "fix", "kind": "band"},
+                {"name": "QA Validator", "mention": "@qa-validator", "stage": "validate", "kind": "band"},
+                {"name": "RCA Publisher", "mention": "@rca-publisher", "stage": "rca", "kind": "band"},
+            ],
+        },
+    })
+
+    # 3. Post to Band chatroom
+    try:
+        import requests as http_requests
+
+        band_username = os.getenv("BAND_USERNAME", "zealox587").strip()
+        triager_handle = f"{band_username}/alert-triager"
 
         data = {
             "message": {
-                "content": f"@alert-triager\n```json\n{json.dumps(alert_data, indent=2)}\n```",
-                "mentions": [
-                    {"handle": "zealox587/alert-triager"}
-                ]
+                "content": f"@{triager_handle}\n```json\n{json.dumps(alert, indent=2)}\n```",
+                "mentions": [{"handle": triager_handle}],
             }
         }
-        
-        import asyncio
+
         response = await asyncio.to_thread(
-            requests.post,
+            http_requests.post,
             f"https://app.band.ai/api/v1/agent/chats/{room_id}/messages",
             headers={
                 "X-API-Key": agent_key,
-                "Content-Type": "application/json"
+                "Content-Type": "application/json",
             },
-            json=data
+            json=data,
+            timeout=30,
         )
         response.raise_for_status()
-        
+        logger.info("Alert posted to Band room %s (run_id=%s)", room_id, run_id)
+
+        # Broadcast "active" so frontend shows triage stage running
+        await hub.broadcast({
+            "run_id": run_id,
+            "stage": "triage",
+            "agent": "Alert Triager",
+            "status": "active",
+            "payload": {"room_id": room_id},
+        })
+
     except Exception as exc:
         METRICS.inc("incidents_failed")
-        await hub.broadcast(failure_payload(str(exc)))
+        logger.exception("Failed to post alert to Band: %s", exc)
+        await hub.broadcast(failure_payload(str(exc), run_id))
 
 
 def failure_payload(error: str, run_id: str = "") -> dict[str, Any]:
